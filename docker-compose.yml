@@ -1,0 +1,145 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: translation_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ai_translator
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: translation_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: translation_orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/ai_translator
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+      - DATASET_SERVICE_URL=http://dataset_service:8001
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dataset_service:
+    build:
+      context: .
+      dockerfile: dataset_service/Dockerfile
+    container_name: translation_dataset_service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/ai_translator
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dataset_worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    container_name: translation_dataset_worker
+    entrypoint: ["celery", "-A", "workers.tasks.celery_app", "worker", "-Q", "dataset", "-c", "1", "--loglevel=info"]
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/ai_translator
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+      - CELERY_WORKER_TYPE=dataset
+    volumes:
+      - ./data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  inference:
+    build:
+      context: .
+      dockerfile: inference/Dockerfile
+    container_name: translation_inference
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - DATA_DIR=/data
+      - DEVICE=cpu
+    volumes:
+      - ./data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: translation_frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_INFERENCE_URL=http://localhost:8080
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - orchestrator
+      - inference
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: translation_prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: translation_grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:
