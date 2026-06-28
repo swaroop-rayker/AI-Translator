@@ -1041,12 +1041,13 @@ export default function App() {
   
   const [selectedDatasetId, setSelectedDatasetId] = useState('');
   const [trainConfig, setTrainConfig] = useState({
-    model_name: 'facebook/mbart-large-50-many-to-many-mmt',
+    model_name: 'facebook/nllb-200-distilled-600M',
     epochs: 3,
     batch_size: 4,
     learning_rate: 0.00005,
     max_sequence_length: 128,
-    fp16: true
+    fp16: true,
+    training_technique: 'full'
   });
 
   // Moses active merge tracker
@@ -1061,6 +1062,9 @@ export default function App() {
   const [sandboxResult, setSandboxResult] = useState(null);
   const [sandboxLoading, setSandboxLoading] = useState(false);
   const [inferenceStatus, setInferenceStatus] = useState(null);
+  const [sandboxModelPath, setSandboxModelPath] = useState('facebook/nllb-200-distilled-600M');
+  const [sandboxModelVersion, setSandboxModelVersion] = useState('Base');
+  const [sandboxModelLoading, setSandboxModelLoading] = useState(false);
 
   // Fetch initial data
   const refreshAll = () => {
@@ -1068,7 +1072,7 @@ export default function App() {
     fetch(`${API_URL}/api/jobs`).then(r => r.json()).then(setJobs).catch(err => {});
     fetch(`${API_URL}/api/experiments`).then(r => r.json()).then(setExperiments).catch(err => {});
     fetch(`${API_URL}/api/models`).then(r => r.json()).then(setModels).catch(err => {});
-    fetch(`${INFERENCE_URL}/status`).then(r => r.json()).then(setInferenceStatus).catch(err => {});
+    fetch(`${INFERENCE_URL}/status`).then(r => r.json()).then(setInferenceStatus).catch(err => setInferenceStatus({ offline: true }));
     fetch(`http://localhost:8001/datasets`).then(r => r.json()).then(setDatasets).catch(err => {});
   };
 
@@ -1400,7 +1404,9 @@ export default function App() {
       epochs: trainConfig.epochs.toString(),
       batch_size: trainConfig.batch_size.toString(),
       learning_rate: trainConfig.learning_rate.toString(),
-      max_sequence_length: trainConfig.max_sequence_length.toString()
+      max_sequence_length: trainConfig.max_sequence_length.toString(),
+      fp16: trainConfig.fp16.toString(),
+      training_technique: (trainConfig.training_technique || 'full')
     });
 
     fetch(`${API_URL}/api/jobs/train?${params.toString()}`, { method: 'POST' })
@@ -1431,6 +1437,33 @@ export default function App() {
     });
   };
 
+  const evaluateModel = (id) => {
+    fetch(`${API_URL}/api/models/${id}/evaluate`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to trigger evaluation");
+      return r.json();
+    })
+    .then(() => {
+      refreshAll();
+      // Start a fast poll every 3s until evaluation finishes
+      const evalPoll = setInterval(() => {
+        fetch(`${API_URL}/api/models`).then(r => r.json()).then(latestModels => {
+          setModels(latestModels);
+          const target = latestModels.find(m => m.id === id);
+          if (target && target.metrics?.evaluation_status !== 'Evaluating') {
+            clearInterval(evalPoll);
+            if (target.metrics?.evaluation_status === 'Completed') {
+              alert(`✅ Evaluation complete!\nBLEU: ${target.metrics.bleu}\nChrF: ${target.metrics.chrf}`);
+            } else if (target.metrics?.evaluation_status === 'Failed') {
+              alert(`❌ Evaluation failed: ${target.metrics?.evaluation_error || 'Unknown error'}`);
+            }
+          }
+        }).catch(() => {});
+      }, 3000);
+    })
+    .catch(err => alert("Evaluation failed: " + err.message));
+  };
+
   // Run Comparisons
   const handleCompare = () => {
     if (selectedRunIds.length === 0) return;
@@ -1441,11 +1474,43 @@ export default function App() {
     .catch(err => alert("Error comparing runs"));
   };
 
+  // Dynamic Inference Model Weight Reloading
+  const handleLoadModel = (e) => {
+    e.preventDefault();
+    if (!sandboxModelPath.trim()) return;
+    setSandboxModelLoading(true);
+    
+    fetch(`${INFERENCE_URL}/reload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model_path: sandboxModelPath,
+        model_version: sandboxModelVersion
+      })
+    })
+    .then(r => {
+      if (!r.ok) {
+        return r.json().then(err => { throw new Error(err.detail || "Model loading failed on inference server"); });
+      }
+      return r.json();
+    })
+    .then(data => {
+      alert(`Model weights loaded successfully: ${data.loaded_model_version}`);
+      setSandboxModelLoading(false);
+      refreshAll();
+    })
+    .catch(err => {
+      alert("Failed to load model: " + err.message);
+      setSandboxModelLoading(false);
+    });
+  };
+
   // Run Inference Sandbox translation
   const handleTranslate = (e) => {
     e.preventDefault();
-    if (!sandboxRequest.text.strip()) return;
+    if (!sandboxRequest.text.trim()) return;
     setSandboxLoading(true);
+    setSandboxResult(null); // Clear previous result to show clean state
     
     fetch(`${INFERENCE_URL}/translate`, {
       method: 'POST',
@@ -1456,13 +1521,18 @@ export default function App() {
         tgt_lang: sandboxRequest.tgt
       })
     })
-    .then(r => r.json())
+    .then(r => {
+      if (!r.ok) {
+        return r.json().then(err => { throw new Error(err.detail || "Translation execution failed on server"); });
+      }
+      return r.json();
+    })
     .then(data => {
       setSandboxResult(data);
       setSandboxLoading(false);
     })
     .catch(err => {
-      setSandboxResult({ error: "Translation request failed. Make sure inference service is online." });
+      setSandboxResult({ error: err.message || "Translation request failed. Make sure inference service is online." });
       setSandboxLoading(false);
     });
   };
@@ -2795,10 +2865,25 @@ export default function App() {
                   </div>
                   <div>
                     <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Base Model / Starting Checkpoint</label>
-                    <select value={trainConfig.model_name} onChange={e => setTrainConfig({...trainConfig, model_name: e.target.value})}>
+                    <select 
+                      value={
+                        (trainConfig.model_name === 'facebook/nllb-200-distilled-600M' || 
+                         trainConfig.model_name === 'facebook/mbart-large-50-many-to-many-mmt' ||
+                         (Array.isArray(models) && models.some(m => m && m.checkpoint_path === trainConfig.model_name)))
+                          ? trainConfig.model_name 
+                          : "custom"
+                      } 
+                      onChange={e => {
+                        if (e.target.value === "custom") {
+                          setTrainConfig({...trainConfig, model_name: ''});
+                        } else {
+                          setTrainConfig({...trainConfig, model_name: e.target.value});
+                        }
+                      }}
+                    >
                       <optgroup label="Standard Pre-trained Models">
-                        <option value="facebook/mbart-large-50-many-to-many-mmt">facebook/mbart-large-50-many-to-many-mmt (Recommended)</option>
-                        <option value="google/mt5-small">google/mt5-small</option>
+                        <option value="facebook/nllb-200-distilled-600M">facebook/nllb-200-distilled-600M (Recommended - Kannada/Malayalam)</option>
+                        <option value="facebook/mbart-large-50-many-to-many-mmt">facebook/mbart-large-50-many-to-many-mmt (Malayalam Only)</option>
                       </optgroup>
                       {Array.isArray(models) && models.length > 0 && (
                         <optgroup label="Trained Checkpoints (Registry)">
@@ -2809,8 +2894,38 @@ export default function App() {
                           ))}
                         </optgroup>
                       )}
+                      <optgroup label="Custom Models">
+                        <option value="custom">-- Custom Model ID (Hugging Face / Disk Path) --</option>
+                      </optgroup>
                     </select>
                   </div>
+                  {!(trainConfig.model_name === 'facebook/nllb-200-distilled-600M' || 
+                     trainConfig.model_name === 'facebook/mbart-large-50-many-to-many-mmt' ||
+                     (Array.isArray(models) && models.some(m => m && m.checkpoint_path === trainConfig.model_name))) && (
+                    <div style={{ marginTop: '4px' }}>
+                      <label style={{ fontSize: '11px', color: '#60a5fa', display: 'block', marginBottom: '4px' }}>Hugging Face Repository ID or Disk Path</label>
+                      <input 
+                        type="text" 
+                        value={trainConfig.model_name} 
+                        onChange={e => setTrainConfig({...trainConfig, model_name: e.target.value})} 
+                        placeholder="e.g. facebook/nllb-200-distilled-1.3B"
+                        required
+                      />
+                    </div>
+                  )}
+                  <div>
+                    <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Training Technique</label>
+                    <select value={trainConfig.training_technique || 'full'} onChange={e => setTrainConfig({...trainConfig, training_technique: e.target.value})}>
+                      <option value="full">Full Fine-Tuning (FP16 AMP)</option>
+                      <option value="lora">LoRA (FP16 fine-tuning - efficient)</option>
+                      <option value="qlora">QLoRA (4-bit fine-tuning - max efficiency)</option>
+                    </select>
+                  </div>
+                  {trainConfig.training_technique !== 'full' && (
+                    <div style={{ background: 'rgba(16, 185, 129, 0.05)', border: '1px dashed rgba(16, 185, 129, 0.25)', padding: '8px 12px', borderRadius: '6px', fontSize: '11px', color: '#34d399', marginTop: '-4px' }}>
+                      💡 <strong>PEFT Optimization Enabled:</strong> Only low-rank adapters will be trained. VRAM footprint is reduced by ~80%, and final checkpoints will be tiny (~20-50 MB).
+                    </div>
+                  )}
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px' }}>
                     <div>
                       <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Epochs</label>
@@ -2886,7 +3001,7 @@ export default function App() {
                             </span>
                           </div>
                           <p style={{ fontSize: '12px', color: '#64748b', marginTop: '6px' }}>
-                            Epochs: {run.hyperparameters?.epochs} | Batch: {run.hyperparameters?.batch_size} | LR: {run.hyperparameters?.learning_rate}
+                            Technique: <strong style={{ color: '#60a5fa' }}>{(run.hyperparameters?.training_technique || 'full').toUpperCase()}</strong> | Epochs: {run.hyperparameters?.epochs} | Batch: {run.hyperparameters?.batch_size} | LR: {run.hyperparameters?.learning_rate}
                           </p>
 
                           {progress && (
@@ -2972,6 +3087,7 @@ export default function App() {
                     <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.05)', textAlign: 'left' }}>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Model Name</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Version</th>
+                      <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Technique</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Metrics</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Approval Status</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Deployment Status</th>
@@ -2983,14 +3099,46 @@ export default function App() {
                       <tr key={m.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
                         <td style={{ padding: '12px', fontSize: '14px', fontWeight: 550 }}>{m.model_name}</td>
                         <td style={{ padding: '12px', fontSize: '13px' }}>{m.version}</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>Loss: {m.metrics?.final_loss} | Size: {m.metrics?.model_size_mb} MB</td>
+                        <td style={{ padding: '12px', fontSize: '13px', textTransform: 'uppercase', fontWeight: 600, color: '#60a5fa' }}>{m.hyperparameters?.training_technique || 'full'}</td>
+                        <td style={{ padding: '12px', fontSize: '13px' }}>
+                          <div>Loss: {m.metrics?.final_loss != null ? Number(m.metrics.final_loss).toFixed(2) : '—'} | Size: {m.metrics?.model_size_mb ? `${Number(m.metrics.model_size_mb).toFixed(0)} MB` : '—'}</div>
+                          {m.metrics?.evaluation_status === 'Evaluating' && (
+                            <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span style={{ display: 'inline-block', width: '8px', height: '8px', borderRadius: '50%', background: '#fbbf24', animation: 'pulse 1.2s ease-in-out infinite' }} />
+                              <span style={{ color: '#fbbf24', fontSize: '12px', fontWeight: 600 }}>Running evaluation on GPU...</span>
+                            </div>
+                          )}
+                          {m.metrics?.evaluation_status === 'Completed' && (
+                            <div style={{ marginTop: '6px', display: 'flex', gap: '10px', alignItems: 'center' }}>
+                              <span style={{ background: 'rgba(34,197,94,0.12)', color: '#22c55e', padding: '2px 8px', borderRadius: '6px', fontSize: '12px', fontWeight: 600 }}>BLEU: {m.metrics.bleu}</span>
+                              <span style={{ background: 'rgba(6,182,212,0.12)', color: '#06b6d4', padding: '2px 8px', borderRadius: '6px', fontSize: '12px', fontWeight: 600 }}>ChrF: {m.metrics.chrf}</span>
+                            </div>
+                          )}
+                          {m.metrics?.evaluation_status === 'Failed' && (
+                            <div style={{ marginTop: '6px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <span style={{ color: '#ef4444', fontSize: '12px', fontWeight: 600 }}>⚠ Evaluation failed</span>
+                            </div>
+                          )}
+                        </td>
                         <td style={{ padding: '12px' }}>
                           <span className={`badge ${m.approval_status === 'Approved' ? 'success' : 'warning'}`}>{m.approval_status}</span>
                         </td>
                         <td style={{ padding: '12px' }}>
                           <span className={`badge ${m.deployment_status === 'Deployed' ? 'info' : 'muted'}`}>{m.deployment_status}</span>
                         </td>
-                        <td style={{ padding: '12px', textAlign: 'right', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                        <td style={{ padding: '12px', textAlign: 'right', display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
+                          {m.metrics?.evaluation_status === 'Evaluating' ? (
+                            <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px', color: '#fbbf24', opacity: 0.7, cursor: 'not-allowed' }} disabled>⏳ Evaluating...</button>
+                          ) : (
+                            <button 
+                              className="secondary" 
+                              style={{ padding: '6px 12px', fontSize: '12px', background: 'rgba(59, 130, 246, 0.05)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.2)' }} 
+                              onClick={() => evaluateModel(m.id)}
+                            >
+                              {m.metrics?.evaluation_status === 'Completed' ? '↻ Re-evaluate' : m.metrics?.evaluation_status === 'Failed' ? '↻ Retry' : '▶ Evaluate'}
+                            </button>
+                          )}
+                          
                           {m.approval_status === 'Pending' && (
                             <button style={{ padding: '6px 12px', fontSize: '12px', background: 'var(--color-success)' }} onClick={() => approveModel(m.id)}>Approve</button>
                           )}
@@ -3014,22 +3162,133 @@ export default function App() {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
                 <h4 style={{ fontSize: '16px', fontWeight: 600 }}>Interactive Translation Sandbox</h4>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                  <span className="badge muted">Stateless</span>
-                  {inferenceStatus?.gpu_fallback_active && (
-                    <span className="badge warning">CPU Fallback Active</span>
+                  {!inferenceStatus ? (
+                    <span className="badge warning">Connecting to inference...</span>
+                  ) : inferenceStatus.offline ? (
+                    <span className="badge danger" style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#fca5a5', border: '1px solid rgba(239, 68, 68, 0.2)', fontSize: '10px', fontWeight: 700 }}>● INFERENCE OFFLINE</span>
+                  ) : (
+                    <>
+                      <span className="badge success" style={{ background: 'rgba(16, 185, 129, 0.1)', color: '#a7f3d0', border: '1px solid rgba(16, 185, 129, 0.2)', fontSize: '10px', fontWeight: 700 }}>● INFERENCE ONLINE</span>
+                      <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
+                        Active: <strong style={{ color: '#e2e8f0' }}>{inferenceStatus.model_version || 'Base'}</strong>
+                      </span>
+                      <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                        Device: <strong style={{ color: '#22d3ee' }}>{(inferenceStatus.active_device || 'cpu').toUpperCase()}</strong>
+                      </span>
+                      {inferenceStatus?.gpu_fallback_active && (
+                        <span className="badge warning" style={{ background: 'rgba(245, 158, 11, 0.1)', color: '#fcd34d', border: '1px solid rgba(245, 158, 11, 0.2)' }}>⚠️ CPU Fallback Active</span>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
 
+              {/* Model Loader Panel */}
+              <div style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.05)', padding: '16px', borderRadius: '8px', marginBottom: '24px' }}>
+                <h5 style={{ fontSize: '13px', fontWeight: 600, color: '#e2e8f0', marginBottom: '12px' }}>Active Sandbox Inference Model</h5>
+                <form onSubmit={handleLoadModel} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'flex-end', gap: '16px' }}>
+                    <div style={{ flexGrow: 1 }}>
+                      <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Select Model or Checkpoint</label>
+                      <select 
+                        disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline)}
+                        value={
+                          (sandboxModelPath === 'facebook/nllb-200-distilled-600M' || 
+                           sandboxModelPath === 'facebook/mbart-large-50-many-to-many-mmt' ||
+                           (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath)))
+                            ? sandboxModelPath 
+                            : "custom"
+                        } 
+                        onChange={e => {
+                          const val = e.target.value;
+                          if (val === "custom") {
+                            setSandboxModelPath('');
+                            setSandboxModelVersion('Custom');
+                          } else {
+                            setSandboxModelPath(val);
+                            // Find version matching checkpoint_path in models
+                            const matchedModel = Array.isArray(models) ? models.find(m => m && m.checkpoint_path === val) : null;
+                            setSandboxModelVersion(matchedModel ? matchedModel.version : 'Base');
+                          }
+                        }}
+                      >
+                        <optgroup label="Base Models">
+                          <option value="facebook/nllb-200-distilled-600M">facebook/nllb-200-distilled-600M (Base NLLB)</option>
+                          <option value="facebook/mbart-large-50-many-to-many-mmt">facebook/mbart-large-50-many-to-many-mmt (Base mBART)</option>
+                        </optgroup>
+                        {Array.isArray(models) && models.length > 0 && (
+                          <optgroup label="Trained Registry Checkpoints">
+                            {models.map(m => m && (
+                              <option key={m.id} value={m.checkpoint_path}>
+                                {m.model_name} ({m.version})
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        <optgroup label="Custom Options">
+                          <option value="custom">-- Custom Model ID (Hugging Face / Disk) --</option>
+                        </optgroup>
+                      </select>
+                    </div>
+                    <button 
+                      type="submit" 
+                      className="secondary" 
+                      disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline) || (inferenceStatus && inferenceStatus.model_path === sandboxModelPath)}
+                      style={{ height: '38px', padding: '0 20px', display: 'flex', alignItems: 'center', gap: '8px' }}
+                    >
+                      {sandboxModelLoading ? "Loading..." : "Load Weights"}
+                    </button>
+                  </div>
+                  
+                  {/* Custom Path Input Field */}
+                  {!(sandboxModelPath === 'facebook/nllb-200-distilled-600M' || 
+                     sandboxModelPath === 'facebook/mbart-large-50-many-to-many-mmt' ||
+                     (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath))) && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: '12px' }}>
+                      <div>
+                        <label style={{ fontSize: '11px', color: '#60a5fa', display: 'block', marginBottom: '4px' }}>Hugging Face Repo ID or Disk Path</label>
+                        <input 
+                          type="text" 
+                          disabled={sandboxModelLoading}
+                          value={sandboxModelPath} 
+                          onChange={e => setSandboxModelPath(e.target.value)} 
+                          placeholder="e.g. facebook/nllb-200-distilled-1.3B"
+                          required
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Version Label</label>
+                        <input 
+                          type="text" 
+                          disabled={sandboxModelLoading}
+                          value={sandboxModelVersion} 
+                          onChange={e => setSandboxModelVersion(e.target.value)} 
+                          placeholder="e.g. Custom-v1"
+                          required
+                        />
+                      </div>
+                    </div>
+                  )}
+                </form>
+              </div>
+
               <form onSubmit={handleTranslate} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', alignItems: 'center', gap: '16px' }}>
-                  <select value={sandboxRequest.src} onChange={e => setSandboxRequest({...sandboxRequest, src: e.target.value})}>
+                  <select 
+                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
+                    value={sandboxRequest.src} 
+                    onChange={e => setSandboxRequest({...sandboxRequest, src: e.target.value})}
+                  >
                     <option value="en">English (en)</option>
                     <option value="kn">Kannada (kn)</option>
                     <option value="ml">Malayalam (ml)</option>
                   </select>
                   <ArrowRight size={18} color="#64748b" />
-                  <select value={sandboxRequest.tgt} onChange={e => setSandboxRequest({...sandboxRequest, tgt: e.target.value})}>
+                  <select 
+                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
+                    value={sandboxRequest.tgt} 
+                    onChange={e => setSandboxRequest({...sandboxRequest, tgt: e.target.value})}
+                  >
                     <option value="kn">Kannada (kn)</option>
                     <option value="ml">Malayalam (ml)</option>
                     <option value="en">English (en)</option>
@@ -3039,24 +3298,41 @@ export default function App() {
                 <div>
                   <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Input Text</label>
                   <textarea 
+                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
                     rows="4" 
                     value={sandboxRequest.text} 
                     onChange={e => setSandboxRequest({...sandboxRequest, text: e.target.value})} 
-                    placeholder="Enter sentence to translate..."
+                    placeholder={(inferenceStatus && inferenceStatus.offline) ? "Inference Service is offline. Start it to run translations..." : "Enter sentence to translate..."}
                     required
                   />
                 </div>
 
-                <button type="submit" disabled={sandboxLoading} style={{ width: 'fit-content' }}>
+                <button 
+                  type="submit" 
+                  disabled={sandboxLoading || !sandboxRequest.text.trim() || (inferenceStatus && inferenceStatus.offline)} 
+                  style={{ width: 'fit-content', background: (inferenceStatus && inferenceStatus.offline) ? '#374151' : undefined }}
+                >
                   {sandboxLoading ? "Translating..." : "Translate"}
                 </button>
               </form>
+
+              {sandboxLoading && (
+                <div className="glass-panel" style={{ marginTop: '24px', background: 'rgba(255,255,255,0.01)', borderLeft: '3px solid var(--color-primary)' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div style={{ width: '12px', height: '12px', borderRadius: '50%', border: '2px solid rgba(255,255,255,0.1)', borderTopColor: '#60a5fa', animation: 'spin 1s linear infinite' }}></div>
+                    <span style={{ fontSize: '13px', color: '#94a3b8' }}>Running forward inference pass through model layers...</span>
+                  </div>
+                </div>
+              )}
 
               {sandboxResult && (
                 <div className="glass-panel" style={{ marginTop: '24px', background: 'rgba(255,255,255,0.02)' }}>
                   <h5 style={{ fontSize: '13px', color: '#94a3b8', marginBottom: '8px' }}>Translation Result</h5>
                   {sandboxResult.error ? (
-                    <p style={{ color: 'var(--color-error)' }}>{sandboxResult.error}</p>
+                    <div style={{ background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.2)', padding: '12px', borderRadius: '6px', color: '#fca5a5', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px' }}>
+                      <AlertCircle size={16} />
+                      <span><strong>Translation Failed:</strong> {sandboxResult.error}</span>
+                    </div>
                   ) : (
                     <div>
                       <p style={{ fontSize: '18px', fontWeight: 600, color: 'var(--color-secondary)' }}>{sandboxResult.translated_text}</p>

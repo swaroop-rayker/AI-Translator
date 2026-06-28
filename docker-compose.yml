@@ -100,6 +100,7 @@ services:
       - DEVICE=cpu
     volumes:
       - ./data:/data
+      - C:/Users/swaro/.cache/huggingface:/root/.cache/huggingface
     depends_on:
       redis:
         condition: service_healthy

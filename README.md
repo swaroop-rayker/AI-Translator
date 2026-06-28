@@ -1,6 +1,6 @@
 # AI Translator: End-to-End Multilingual Translation Lifecycle Platform
 
-AI Translator is a production-grade, microservice-based lifecycle automation platform for multilingual translation model development. It provides full pipeline orchestration—from raw dataset ingestion, character-level filtering, deduplication, and immutable version lineage, to asynchronous model training on hardware nodes, real-time telemetry monitoring, and model serving with dynamic weight reloading.
+AI Translator is a production-grade, microservice-based lifecycle automation platform for multilingual translation model development. It provides full pipeline orchestration—from raw dataset ingestion, character-level filtering, deduplication, and immutable version lineage, to asynchronous parameter-efficient fine-tuning on GPU nodes, isolated evaluation telemetry, and real-time model serving with dynamic weight reloading.
 
 ---
 
@@ -20,8 +20,10 @@ graph TD
     end
 
     DatasetWorker <--> |HTTP| DatasetService[Dataset Processing Service]
-    GPUWorker --> |Spawns Subprocess| PyTorchTrainer[PyTorch MBart-50 Trainer]
+    GPUWorker --> |Spawns Subprocess| PyTorchTrainer[PyTorch Trainer Engine]
+    GPUWorker --> |Spawns Subprocess| StandaloneEvaluator[Standalone Evaluator Subprocess]
     PyTorchTrainer --> |Reads/Writes Checkpoints| LocalStorage[(Local SSD Storage /data)]
+    StandaloneEvaluator --> |Computes BLEU/ChrF| LocalStorage
 
     Orchestrator <--> |HTTP| InferenceService[Inference Service: Port 8002]
     InferenceService --> |Dynamic Weight Reload| LocalStorage
@@ -38,74 +40,50 @@ The Orchestrator acts as the central state ledger and command gateway. It provid
 * **API Routing**:
   * `POST /jobs/submit`: Accepts training hyperparameter configs, validates inputs against Pydantic schemas, and enqueues Celery tasks.
   * `POST /jobs/{job_id}/pause`: Places a `.signal` file on disk to trigger graceful shutdown in the trainer.
-  * `POST /jobs/{job_id}/resume`: Resolves the historical experiment run using name patterns (e.g. matching `run-{job_id[:8]}%`), updates database flags back to `Queued`, and re-schedules the task.
+  * `POST /jobs/{job_id}/resume`: Resolves the historical experiment run, updates database flags back to `Queued`, and re-schedules the task.
+  * `POST /models/{model_id}/evaluate`: Triggers an asynchronous evaluation Celery task on the GPU worker.
 
 ---
 
-### 2. Distributed GPU Scheduler & Lock Manager
+### 2. Distributed GPU Scheduler & Lock Coordinator
 To prevent concurrent GPU execution spikes on shared workstations (such as laptop CUDA devices with limited VRAM), the platform implements a distributed locking coordinator.
 
-* **Redis-Based GPU Lock**: The class `gpu_scheduler` uses Redis to enforce mutual exclusion. When a Celery worker initiates a GPU training task, it must call `gpu_scheduler.acquire_lock(job_id)`.
+* **Redis-Based GPU Lock**: The class `gpu_scheduler` uses Redis to enforce mutual exclusion. When a Celery worker initiates a GPU training or evaluation task, it must call `gpu_scheduler.acquire_lock(job_id)`.
 * **Task Queuing**: If the GPU lock is already held by another job, the Celery task yields and is placed back in the queue.
 * **Serving Co-existence (CPU Fallback)**: The inference service runs on **CPU by default**. This ensures that translation inference APIs remain online 24/7 with zero VRAM competition, keeping the GPU's memory pool completely available for training.
 
 ---
 
-### 3. Immutable Dataset Cleaning & Versioning Service
-The Dataset Service manages character normalizations and lineage trees.
+### 3. Parameter-Efficient Fine-Tuning (PEFT) Engine
+The training loop utilizes Hugging Face Accelerate and PEFT (Parameter-Efficient Fine-Tuning) to support multiple training modes:
 
-* **Unicode Normalization**: Raw inputs are processed using **Unicode NFKC normalization** to eliminate variations in character representations.
-* **Character-Level Language Range Filters**:
-  * **Kannada Matcher**: Detects text inside the Kannada Unicode block `\u0c80-\u0cff` and validates character density.
-  * **Malayalam Matcher**: Detects text inside the Malayalam Unicode block `\u0d00-\u0d7f`.
-* **Cryptographic Deduplication**: Generates an MD5 hash of clean source-target sentence pairs. Duplicate records are dropped before committing.
-* **Version Tree Lineage**: Every processed dataset version stores a `parent_id` foreign key. This establishes an immutable version history tree, letting developers trace how a dataset evolved across cleaning stages.
+* **Full Fine-Tuning**: Trains all model parameters in mixed-precision (FP16).
+* **LoRA (Low-Rank Adaptation)**: Freezes the base model and injects low-rank trainable weight matrices into attention layers (query, value projection layers), cutting down trainable parameter counts by 99% while preserving performance.
+* **QLoRA (Quantized Low-Rank Adaptation)**: Loads the base model in 4-bit precision using **NormalFloat4 (NF4)** weight quantization with double-quantization. Trainable LoRA matrices are attached on top of the quantized layers. This enables fine-tuning 600M+ parameter translation models (like NLLB-200) on consumer laptop GPUs (e.g. RTX 4050 6GB VRAM) with minimal memory footprint.
 
 ---
 
-### 4. PyTorch Training Engine & Checkpointing
-The training loop utilizes Hugging Face Accelerate to run mixed-precision training.
+### 4. Isolated Subprocess Evaluation Engine (sacreBLEU & ChrF)
+To ensure complete system stability and prevent GPU memory leaks, translation evaluation is isolated:
 
-* **Mixed Precision (FP16)**: Computes forward and backward passes in 16-bit floating point, using a `GradScaler` to scale loss values dynamically and prevent underflow in small gradients.
-* **Graceful Pause Mechanics**:
-  When a pause signal is received:
-  1. The training loop catches the signal at the batch boundary.
-  2. It invokes `accelerator.save_state()`, saving:
-     - Model weights (`model.safetensors`)
-     - Optimizer momentum buffers (`optimizer.bin`)
-     - Learning rate scheduler parameters (`scheduler.bin`)
-     - RNG states (`random_states_0.pkl`) for PyTorch, NumPy, Python, and CUDA (preserving dropout and shuffling consistency)
-     - Dataloader sampler indices (`sampler.bin`)
-  3. Writes training telemetry (`epoch`, `step`, `global_step`) to `pause_meta.json`.
-  4. Releases VRAM cleanly: Calls `gc.collect()` and `torch.cuda.empty_cache()` to release the CUDA memory context.
-* **Resuming with Dataloader Skip Loop**:
-  Upon relaunch, the engine loads all states using `accelerator.load_state()`. To avoid duplicate computations on already processed data:
-  ```python
-  for step, batch in enumerate(train_dataloader):
-      if epoch == resume_epoch and step <= resume_step:
-          continue  # Fast-forward past completed batches without running CUDA graphs
-  ```
+* **Subprocess Isolation**: Spawning evaluation directly within the Celery worker process would leave PyTorch's heavy **CUDA context** stuck in VRAM indefinitely. The platform resolves this by spawning `training/evaluator.py` as an independent subprocess.
+* **Process Exit Cleanup**: Once the evaluation is finished, the subprocess exits completely, causing the OS to automatically destroy its CUDA context and free **100% of the VRAM**.
+* **Metrics Computed**:
+  * **sacreBLEU**: Word-level n-gram overlap precision score.
+  * **ChrF**: Character-level n-gram F-score, which is highly accurate and robust for morphologically rich Indian languages (like Kannada and Malayalam).
+* **UI Integration**: The UI displays live evaluation indicators (`⏳ Evaluating...`), auto-polls the database every 3 seconds for updates, and displays final score badges (green BLEU/cyan ChrF) in the registry.
 
 ---
 
-### 5. Dynamic Inference Service with Zero-Downtime Reloading
-The Inference Service runs independently of the training microservice.
-
-* **Isolation**: Decoupled Flask/FastAPI app running on CPU, serving translation models.
-* **Dynamic Weight Reloading**:
-  When a model is approved in the registry:
-  1. The orchestrator hits `POST /reload` on the inference service.
-  2. The inference service spawns a separate thread to load the new weights (`.safetensors`) from the registry path into system RAM.
-  3. It swaps the active generator model reference atomically, ensuring zero-downtime serving.
+### 5. Host-to-Container Shared Hugging Face Cache
+To prevent redundant downloads of massive translation weights (e.g. 2.46 GB for NLLB-200) when rebuilds or reloading occur:
+* The `docker-compose.yml` mounts the Windows host Hugging Face cache directory `C:/Users/swaro/.cache/huggingface` to the container path `/root/.cache/huggingface`.
+* The local Celery workers and Docker container instances share a single source of truth, optimizing initialization speed from minutes to seconds.
 
 ---
 
-### 6. Hardware Telemetry & Monitoring
-The system provides continuous metrics collections for hardware status tracking.
-
-* **Telemetry Worker**: A daemon thread queries system usage every 2 seconds via `psutil` (CPU usage, system RAM) and `GPUtil` (GPU utility, VRAM allocation).
-* **APIs & Export**: Metrics are pushed to the Redis cache (to update the frontend progress panels in real-time) and exposed to a `/metrics` endpoint.
-* **Monitoring Stack**: Prometheus polls `/metrics` periodically, saving data to time-series databases. Grafana reads Prometheus to visualize historical resource trends.
+### 6. Security Baseline (PyTorch 2.6 + CUDA 12.4)
+The local host virtual environment is upgraded to PyTorch `2.6.0+cu124` to comply with Hugging Face's security policies regarding the loading of pickle-based checkpoint formats (**CVE-2025-32434**), preventing code execution vulnerabilities while utilizing GPU acceleration natively.
 
 ---
 
@@ -129,12 +107,14 @@ The system provides continuous metrics collections for hardware status tracking.
 │   ├── app/
 │   │   └── translator.py      # Translation models loading & generation
 │   └── Dockerfile
-├── training/                  # Accelerated PyTorch Trainer Engine
-│   └── trainer.py             # Training loop, telemetry metrics & checkpointing
+├── training/                  # Accelerated PyTorch Trainer & Evaluator Engine
+│   ├── trainer.py             # Training loop, telemetry metrics & checkpointing
+│   └── evaluator.py           # Standalone subprocess model evaluator (BLEU/ChrF)
 ├── workers/                   # Background Celery task definitions
-│   └── tasks.py               # Dataset processing & training wrappers
+│   └── tasks.py               # Dataset processing, training & evaluation wrappers
 ├── monitoring/                # Prometheus & Grafana configs
 ├── docker-compose.yml         # Dev environment container orchestrator
+├── evaluate_model.py          # Interactive command-line evaluator script
 └── README.md
 ```
 
@@ -183,3 +163,4 @@ npm install
 npm run dev
 ```
 Access the interface at `http://localhost:5173`.
+

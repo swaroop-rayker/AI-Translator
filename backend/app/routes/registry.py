@@ -133,3 +133,30 @@ def deploy_model(model_id: str, db: Session = Depends(get_db)):
         "deployment_status": model.deployment_status,
         "inference_reload_status": inference_status
     }
+
+@router.post("/{model_id}/evaluate")
+def evaluate_model_route(model_id: str, db: Session = Depends(get_db)):
+    """
+    Triggers an asynchronous accuracy evaluation (sacreBLEU and ChrF)
+    for the specified model on its validation dataset.
+    """
+    model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+    if not model:
+        raise HTTPException(status_code=404, detail="Model not found")
+        
+    # Mark status as Evaluating
+    curr_metrics = dict(model.metrics or {})
+    curr_metrics["evaluation_status"] = "Evaluating"
+    curr_metrics.pop("evaluation_error", None)
+    model.metrics = curr_metrics
+    
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(model, "metrics")
+    db.commit()
+    
+    # Trigger Celery evaluation task
+    from workers.tasks import evaluate_model_task
+    evaluate_model_task.delay(model_id)
+    
+    return {"status": "Evaluation started", "model_id": model_id}
+

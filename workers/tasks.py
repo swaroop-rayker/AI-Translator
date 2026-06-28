@@ -14,10 +14,11 @@ if os.path.normcase(parent_dir) not in normalized_paths:
 
 from celery import Celery
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 # Import core modules
 from backend.app.core.database import SessionLocal
-from backend.app.models.schemas import Job, DatasetVersion, ExperimentRun
+from backend.app.models.schemas import Job, DatasetVersion, ExperimentRun, ModelRegistry
 from backend.app.core.state_manager import StateManager
 from backend.app.core.scheduler import gpu_scheduler
 from dataset_service.app.routes.datasets import process_dataset, validate_dataset
@@ -35,6 +36,7 @@ celery_app.conf.update(
     task_routes={
         "workers.tasks.process_dataset_task": {"queue": "dataset"},
         "workers.tasks.train_model_task": {"queue": "training"},
+        "workers.tasks.evaluate_model_task": {"queue": "training"},
     },
     task_serializer="json",
     accept_content=["json"],
@@ -191,6 +193,7 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
                         if epoch is not None:
                             metrics_history["epoch"].append(int(epoch))
                         r.metrics = metrics_history
+                        flag_modified(r, "metrics")
                     
                     if system_metrics:
                         hw_history = r.hardware_telemetry or {"cpu": [], "gpu": [], "vram": [], "ram": [], "disk": []}
@@ -200,6 +203,7 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
                         hw_history["ram"].append(system_metrics.get("ram", 0))
                         hw_history["disk"].append(system_metrics.get("disk", 0))
                         r.hardware_telemetry = hw_history
+                        flag_modified(r, "hardware_telemetry")
                     
                     callback_db.commit()
                     
@@ -416,3 +420,113 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
         # Always release GPU lock
         gpu_scheduler.release_gpu_lock(job_id)
         db.close()
+
+@celery_app.task(name="workers.tasks.evaluate_model_task")
+def evaluate_model_task(model_id: str):
+    import subprocess
+    import json
+    from sqlalchemy.orm.attributes import flag_modified
+    
+    db = SessionLocal()
+    try:
+        model_record = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+        if not model_record:
+            logger.error(f"Model registry record {model_id} not found during evaluation task.")
+            return
+            
+        dataset_ver = db.query(DatasetVersion).filter(DatasetVersion.id == model_record.dataset_version_id).first()
+        if not dataset_ver:
+            logger.error(f"Dataset version for model {model_id} not found.")
+            return
+            
+        # Resolve dataset path
+        dataset_path = dataset_ver.storage_path
+        data_dir = os.getenv("DATA_DIR", "/data")
+        
+        # Translate to local path if not exists
+        if not os.path.exists(dataset_path):
+            rel_path = dataset_path.replace("/data", "")
+            dataset_path = os.path.join(data_dir, rel_path.lstrip("/\\"))
+            
+        if not os.path.exists(dataset_path):
+            raise FileNotFoundError(f"Dataset validation file not found at: {dataset_path}")
+            
+        # Resolve checkpoint path
+        checkpoint_path = model_record.checkpoint_path
+        if not os.path.exists(checkpoint_path):
+            rel_path = checkpoint_path.replace("/data", "")
+            checkpoint_path = os.path.join(data_dir, rel_path.lstrip("/\\"))
+            
+        base_model_name = model_record.hyperparameters.get("model_name", "facebook/nllb-200-distilled-600M") if model_record.hyperparameters else "facebook/nllb-200-distilled-600M"
+        tech = model_record.hyperparameters.get("training_technique", "full") if model_record.hyperparameters else "full"
+        src_lang = dataset_ver.src_lang
+        tgt_lang = dataset_ver.tgt_lang
+        
+        evaluator_script = os.path.join(parent_dir, "training", "evaluator.py")
+        
+        logger.info(f"Spawning evaluation subprocess for model {model_id}...")
+        
+        cmd = [
+            sys.executable,
+            evaluator_script,
+            "--dataset-path", dataset_path,
+            "--checkpoint-path", checkpoint_path,
+            "--base-model", base_model_name,
+            "--technique", tech,
+            "--src-lang", src_lang,
+            "--tgt-lang", tgt_lang
+        ]
+        
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8"
+        )
+        
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            raise RuntimeError(f"Evaluator subprocess exited with code {process.returncode}. Error: {stderr}")
+            
+        # Parse JSON output from stdout
+        try:
+            lines = stdout.strip().split("\n")
+            result_json = None
+            for line in reversed(lines):
+                if line.strip().startswith("{") and line.strip().endswith("}"):
+                    result_json = json.loads(line)
+                    break
+            if not result_json:
+                raise ValueError("Could not find JSON output in evaluator stdout.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse evaluator output: {e}. Output was:\n{stdout}")
+            
+        # Save results to DB
+        curr_metrics = dict(model_record.metrics or {})
+        curr_metrics["bleu"] = result_json["bleu"]
+        curr_metrics["chrf"] = result_json["chrf"]
+        curr_metrics["evaluation_status"] = "Completed"
+        
+        model_record.metrics = curr_metrics
+        flag_modified(model_record, "metrics")
+        db.commit()
+        logger.info(f"Successfully evaluated model {model_id} via subprocess: BLEU={result_json['bleu']}, ChrF={result_json['chrf']}")
+        
+    except Exception as e:
+        logger.error(f"Failed to evaluate model {model_id}: {e}", exc_info=True)
+        try:
+            model_record = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+            if model_record:
+                curr_metrics = dict(model_record.metrics or {})
+                curr_metrics["evaluation_status"] = "Failed"
+                curr_metrics["evaluation_error"] = str(e)
+                model_record.metrics = curr_metrics
+                flag_modified(model_record, "metrics")
+                db.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to write failure status to DB: {db_err}")
+    finally:
+        db.close()
+

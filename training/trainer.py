@@ -9,8 +9,8 @@ import logging
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from transformers import (
-    MBartForConditionalGeneration,
-    MBart50TokenizerFast,
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
     get_scheduler
 )
 from accelerate import Accelerator
@@ -28,6 +28,13 @@ MBART_LANG_MAP = {
     "en": "en_XX",
     "kn": "kn_IN",
     "ml": "ml_IN"
+}
+
+# NLLB-200 language codes mapping
+NLLB_LANG_MAP = {
+    "en": "eng_Latn",
+    "kn": "kan_Knda",
+    "ml": "mal_Mlym"
 }
 
 def get_system_telemetry():
@@ -214,27 +221,72 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
             stage_details="Loading Hugging Face tokenizer and language tags..."
         )
         
-    # 3. Load Tokenizer & Model for mBART-50
-    logger.info(f"Loading pretrained mBART-50 model: {model_name}")
-    tokenizer = MBart50TokenizerFast.from_pretrained(model_name)
+    # 3. Load Tokenizer & Model for Seq2Seq fine-tuning
+    training_technique = config.get("training_technique", "full")
+    logger.info(f"Loading pretrained model: {model_name} (Technique: {training_technique})")
     
-    if callback:
-        callback(
-            stage="loading_model",
-            stage_progress=40.0,
-            stage_details="Loading model weights into memory/GPU (2.33 GB)..."
-        )
-        
-    model = MBartForConditionalGeneration.from_pretrained(model_name)
+    is_nllb = "nllb" in model_name.lower()
+    LANG_MAP = NLLB_LANG_MAP if is_nllb else MBART_LANG_MAP
     
     # Configure source and target language tags
     src_lang = config.get("src_lang", "en")
     tgt_lang = config.get("tgt_lang", "kn")
     
-    src_lang_tag = MBART_LANG_MAP.get(src_lang, "en_XX")
-    tgt_lang_tag = MBART_LANG_MAP.get(tgt_lang, "kn_IN")
+    src_lang_tag = LANG_MAP.get(src_lang, "eng_Latn" if is_nllb else "en_XX")
+    tgt_lang_tag = LANG_MAP.get(tgt_lang, "kan_Knda" if is_nllb else "ml_IN" if tgt_lang == "ml" else "kn_IN")
     
-    tokenizer.src_lang = src_lang_tag
+    # Load tokenizer
+    if is_nllb:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, src_lang=src_lang_tag, tgt_lang=tgt_lang_tag)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.src_lang = src_lang_tag
+        
+    if callback:
+        callback(
+            stage="loading_model",
+            stage_progress=40.0,
+            stage_details=f"Loading model weights using {training_technique.upper()}..."
+        )
+        
+    if training_technique == "qlora":
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16
+        )
+        logger.info(f"QLoRA Mode: Loading base model in 4-bit onto {device}...")
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map={"": device}
+        )
+    else:
+        logger.info("Standard Mode: Loading base model...")
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    # Apply PEFT LoRA adapter if requested
+    if training_technique in ["lora", "qlora"]:
+        from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+        
+        if training_technique == "qlora":
+            logger.info("Preparing quantized model for k-bit training...")
+            model = prepare_model_for_kbit_training(model)
+            
+        logger.info("Applying LoRA adapter to model...")
+        peft_config = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            inference_mode=False,
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj"]
+        )
+        model = get_peft_model(model, peft_config)
+        model.print_trainable_parameters()
+
 
     # 4. Tokenize natively in Python (completely bypass PyArrow mapping)
     def tokenize_records(records_list, is_val=False):
@@ -332,9 +384,15 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
             stage_details="Optimizing model structures for GPU acceleration..."
         )
         
-    model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, val_dataloader, lr_scheduler
-    )
+    if training_technique == "qlora":
+        # Skip preparing model with accelerator to avoid device map/quantization placement conflicts
+        optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            optimizer, train_dataloader, val_dataloader, lr_scheduler
+        )
+    else:
+        model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, val_dataloader, lr_scheduler
+        )
     
     if callback:
         callback(

@@ -99,13 +99,14 @@ def submit_dataset_processing(
 @router.post("/train")
 def submit_training_run(
     dataset_version_id: str,
-    model_name: str = "facebook/mbart-large-50-many-to-many-mmt",
+    model_name: str = "facebook/nllb-200-distilled-600M",
     epochs: int = 3,
     batch_size: int = 4,
     learning_rate: float = 5e-5,
     max_sequence_length: int = 128,
     fp16: bool = True,
     checkpoint_frequency: int = 1,
+    training_technique: str = "full",
     db: Session = Depends(get_db)
 ):
     """
@@ -146,6 +147,7 @@ def submit_training_run(
         "max_sequence_length": max_sequence_length,
         "fp16": fp16,
         "checkpoint_frequency": checkpoint_frequency,
+        "training_technique": training_technique,
         "src_lang": dataset_version.src_lang,
         "tgt_lang": dataset_version.tgt_lang
     }
@@ -339,6 +341,7 @@ def purge_failed_jobs(db: Session = Depends(get_db)):
     - Never deletes experiment runs that are referenced in ModelRegistry.
     - Never deletes dataset versions referenced by active/successful runs or models.
     """
+    data_dir = os.getenv("DATA_DIR", "/data")
     # 1. Fetch failed/cancelled jobs and runs
     stale_jobs = db.query(Job).filter(Job.status.in_(["Failed", "Cancelled"])).all()
     

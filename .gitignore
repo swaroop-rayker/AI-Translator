@@ -146,6 +146,8 @@ data/
 *.pt
 *.pkl
 *.signal
+scratch_*.py
+
 
 # IDEs and Editors
 .vscode/
