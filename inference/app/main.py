@@ -66,6 +66,20 @@ def reload_model(request: ReloadRequest):
         "active_engine": translator_engine.current_engine
     }
 
+@app.post("/unload")
+def unload_model():
+    """
+    Releases loaded inference model/tokenizer weights from process RAM/VRAM.
+    """
+    translator_engine.unload_model()
+    return {
+        "status": "success",
+        "model_loaded": False,
+        "loaded_model_version": translator_engine.current_model_version,
+        "loaded_model_path": translator_engine.current_model_path,
+        "active_engine": translator_engine.current_engine
+    }
+
 @app.get("/status")
 def get_inference_status():
     """
@@ -75,6 +89,7 @@ def get_inference_status():
     return {
         "model_version": translator_engine.current_model_version,
         "model_path": translator_engine.current_model_path,
+        "model_loaded": translator_engine.current_model_path is not None,
         "active_device": device,
         "active_engine": translator_engine.current_engine,
         "gpu_fallback_active": (device == "cpu" and translator_engine.default_device != "cpu")

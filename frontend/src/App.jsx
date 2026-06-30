@@ -1030,6 +1030,7 @@ export default function App() {
   const activeTrainingJob = Array.isArray(jobs) ? jobs.find(j => j && j.job_type === 'training' && (j.status === 'Running' || j.status === 'Starting' || j.status === 'Queued' || j.status === 'Paused')) : null;
   const [experiments, setExperiments] = useState([]);
   const [models, setModels] = useState([]);
+  const [discoveredModelArtifacts, setDiscoveredModelArtifacts] = useState([]);
   const [mockModels, setMockModels] = useState([
     {
       id: 'mock-1',
@@ -1110,6 +1111,7 @@ export default function App() {
   const [sandboxModelVersion, setSandboxModelVersion] = useState('Base');
   const [sandboxEngine, setSandboxEngine] = useState('ctranslate2');
   const [sandboxModelLoading, setSandboxModelLoading] = useState(false);
+  const [sandboxModelUnloading, setSandboxModelUnloading] = useState(false);
   const [sandboxModelLoadStage, setSandboxModelLoadStage] = useState(null);
   const [sandboxLoadError, setSandboxLoadError] = useState(null);
   const [sandboxTranslateStage, setSandboxTranslateStage] = useState(null);
@@ -1121,6 +1123,7 @@ export default function App() {
     fetch(`${API_URL}/api/jobs`).then(r => r.json()).then(setJobs).catch(err => {});
     fetch(`${API_URL}/api/experiments`).then(r => r.json()).then(setExperiments).catch(err => {});
     fetch(`${API_URL}/api/models`).then(r => r.json()).then(setModels).catch(err => {});
+    fetch(`${API_URL}/api/models/discover-artifacts`).then(r => r.json()).then(setDiscoveredModelArtifacts).catch(err => {});
     fetch(`${INFERENCE_URL}/status`).then(r => r.json()).then(setInferenceStatus).catch(err => setInferenceStatus({ offline: true }));
     fetch(`http://localhost:8001/datasets`).then(r => r.json()).then(setDatasets).catch(err => {});
   };
@@ -1647,6 +1650,35 @@ export default function App() {
       } catch(e) {}
       setSandboxLoadError({ stage: errStage, message: errMsg });
       setSandboxModelLoading(false);
+      setSandboxModelLoadStage(null);
+    });
+  };
+
+  const handleUnloadModel = () => {
+    if (!window.confirm("Unload inference model weights from RAM/VRAM? Translations will be unavailable until you load weights again.")) return;
+    setSandboxLoadError(null);
+    setSandboxModelUnloading(true);
+    setSandboxModelLoadStage("Releasing model weights from memory...");
+
+    fetch(`${INFERENCE_URL}/unload`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) {
+        return r.json().then(err => { throw new Error(err.detail || "Model unload failed on inference server"); });
+      }
+      return r.json();
+    })
+    .then(() => {
+      setSandboxModelLoadStage("Weights unloaded from inference memory.");
+      setTimeout(() => {
+        setSandboxModelUnloading(false);
+        setSandboxModelLoadStage(null);
+        setSandboxResult(null);
+        refreshAll();
+      }, 500);
+    })
+    .catch(err => {
+      setSandboxLoadError({ stage: "Unloading model weights", message: err.message });
+      setSandboxModelUnloading(false);
       setSandboxModelLoadStage(null);
     });
   };
@@ -3357,6 +3389,7 @@ export default function App() {
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Version</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Technique</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Metrics</th>
+                      <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Files</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Approval Status</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8' }}>Deployment Status</th>
                       <th style={{ padding: '12px', fontSize: '12px', color: '#94a3b8', textAlign: 'right' }}>Actions</th>
@@ -3389,6 +3422,17 @@ export default function App() {
                           )}
                         </td>
                         <td style={{ padding: '12px' }}>
+                          <span 
+                            className={`badge ${m.artifact_status?.status === 'available' ? 'success' : 'danger'}`}
+                            title={m.artifact_status?.status === 'available' ? m.artifact_status?.resolved_checkpoint_path : `Missing: ${(m.artifact_status?.missing_files || ['checkpoint folder']).join(', ')}`}
+                          >
+                            {m.artifact_status?.status === 'available' ? 'Exists' : 'Missing'}
+                          </span>
+                          {m.artifact_status?.status === 'available' && m.artifact_status?.is_peft_adapter && (
+                            <div style={{ marginTop: '4px', fontSize: '10px', color: '#60a5fa', fontWeight: 600 }}>Adapter</div>
+                          )}
+                        </td>
+                        <td style={{ padding: '12px' }}>
                           <span className={`badge ${m.approval_status === 'Approved' ? 'success' : 'warning'}`}>{m.approval_status}</span>
                         </td>
                         <td style={{ padding: '12px' }}>
@@ -3401,6 +3445,7 @@ export default function App() {
                             <button 
                               className="secondary" 
                               style={{ padding: '6px 12px', fontSize: '12px', background: 'rgba(59, 130, 246, 0.05)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.2)' }} 
+                              disabled={m.artifact_status?.status === 'missing'}
                               onClick={() => evaluateModel(m.id)}
                             >
                               {m.metrics?.evaluation_status === 'Completed' ? '↻ Re-evaluate' : m.metrics?.evaluation_status === 'Failed' ? '↻ Retry' : '▶ Evaluate'}
@@ -3426,6 +3471,7 @@ export default function App() {
                                 <button 
                                   className="secondary" 
                                   style={{ padding: '6px 12px', fontSize: '12px', background: 'rgba(16, 185, 129, 0.1)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.2)' }} 
+                                  disabled={m.artifact_status?.status === 'missing'}
                                   onClick={() => {
                                     const engine = document.getElementById(`deploy-engine-${m.id}`).value;
                                     deployModel(m.id, engine);
@@ -3461,7 +3507,7 @@ export default function App() {
                     <>
                       <span className="badge success" style={{ background: 'rgba(16, 185, 129, 0.1)', color: '#a7f3d0', border: '1px solid rgba(16, 185, 129, 0.2)', fontSize: '10px', fontWeight: 700 }}>● INFERENCE ONLINE</span>
                       <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
-                        Active: <strong style={{ color: '#e2e8f0' }}>{inferenceStatus.model_version || 'Base'}</strong>
+                        Active: <strong style={{ color: inferenceStatus.model_loaded ? '#e2e8f0' : '#fca5a5' }}>{inferenceStatus.model_loaded ? (inferenceStatus.model_version || 'Base') : 'Unloaded'}</strong>
                       </span>
                       <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
                         Engine: <strong style={{ color: '#fbbf24', textTransform: 'uppercase' }}>{inferenceStatus.active_engine || 'pytorch'}</strong>
@@ -3481,15 +3527,16 @@ export default function App() {
               <div style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.05)', padding: '16px', borderRadius: '8px', marginBottom: '24px' }}>
                 <h5 style={{ fontSize: '13px', fontWeight: 600, color: '#e2e8f0', marginBottom: '12px' }}>Active Sandbox Inference Model</h5>
                 <form onSubmit={handleLoadModel} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', alignItems: 'flex-end', gap: '16px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto auto', alignItems: 'flex-end', gap: '16px' }}>
                     <div style={{ flexGrow: 1 }}>
                       <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Select Model or Checkpoint</label>
                       <select 
-                        disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline)}
+                        disabled={sandboxModelLoading || sandboxModelUnloading || (inferenceStatus && inferenceStatus.offline)}
                         value={
                           (sandboxModelPath === 'facebook/nllb-200-distilled-600M' || 
                            sandboxModelPath === 'facebook/mbart-large-50-many-to-many-mmt' ||
-                           (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath)))
+                           (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath)) ||
+                           (Array.isArray(discoveredModelArtifacts) && discoveredModelArtifacts.some(m => m && m.checkpoint_path === sandboxModelPath)))
                             ? sandboxModelPath 
                             : "custom"
                         } 
@@ -3502,13 +3549,18 @@ export default function App() {
                             setSandboxModelPath(val);
                             // Find version matching checkpoint_path in models
                             const matchedModel = Array.isArray(models) ? models.find(m => m && m.checkpoint_path === val) : null;
-                            setSandboxModelVersion(matchedModel ? matchedModel.version : 'Base');
+                            const matchedArtifact = Array.isArray(discoveredModelArtifacts) ? discoveredModelArtifacts.find(m => m && m.checkpoint_path === val) : null;
+                            setSandboxModelVersion(matchedModel ? matchedModel.version : matchedArtifact ? matchedArtifact.version : 'Base');
                             if (matchedModel && matchedModel.deployment_status) {
                               if (matchedModel.deployment_status.includes('CTRANSLATE2')) {
                                 setSandboxEngine('ctranslate2');
                               } else if (matchedModel.deployment_status.includes('PYTORCH')) {
                                 setSandboxEngine('pytorch');
                               }
+                            } else if (matchedArtifact?.artifact_status?.ctranslate2_exists) {
+                              setSandboxEngine('ctranslate2');
+                            } else if (matchedArtifact) {
+                              setSandboxEngine('pytorch');
                             }
                           }
                         }}
@@ -3520,10 +3572,21 @@ export default function App() {
                         {Array.isArray(models) && models.length > 0 && (
                           <optgroup label="Trained Registry Checkpoints">
                             {models.map(m => m && (
-                              <option key={m.id} value={m.checkpoint_path}>
-                                {m.model_name} ({m.version})
+                              <option key={m.id} value={m.checkpoint_path} disabled={m.artifact_status?.status === 'missing'}>
+                                {m.model_name} ({m.version}) {m.artifact_status?.status === 'missing' ? '[missing files]' : ''}
                               </option>
                             ))}
+                          </optgroup>
+                        )}
+                        {Array.isArray(discoveredModelArtifacts) && discoveredModelArtifacts.filter(a => a && !models.some(m => m && m.checkpoint_path === a.checkpoint_path)).length > 0 && (
+                          <optgroup label="Recovered Fine-Tuned Models">
+                            {discoveredModelArtifacts
+                              .filter(a => a && !models.some(m => m && m.checkpoint_path === a.checkpoint_path))
+                              .map(a => (
+                                <option key={a.id} value={a.checkpoint_path}>
+                                  {a.model_name} ({a.version}) - {a.folder_name}
+                                </option>
+                              ))}
                           </optgroup>
                         )}
                         <optgroup label="Custom Options">
@@ -3534,7 +3597,7 @@ export default function App() {
                     <div>
                       <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Serving Engine</label>
                       <select 
-                        disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline)}
+                        disabled={sandboxModelLoading || sandboxModelUnloading || (inferenceStatus && inferenceStatus.offline)}
                         value={sandboxEngine} 
                         onChange={e => setSandboxEngine(e.target.value)}
                         style={{ height: '38px', padding: '0 10px', fontSize: '13px', color: '#e2e8f0', background: 'rgba(30, 41, 59, 0.5)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', cursor: 'pointer' }}
@@ -3546,23 +3609,33 @@ export default function App() {
                     <button 
                       type="submit" 
                       className="secondary" 
-                      disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline) || (inferenceStatus && inferenceStatus.model_path === sandboxModelPath && inferenceStatus.active_engine === sandboxEngine)}
+                      disabled={sandboxModelLoading || sandboxModelUnloading || (inferenceStatus && inferenceStatus.offline) || (inferenceStatus && inferenceStatus.model_path === sandboxModelPath && inferenceStatus.active_engine === sandboxEngine) || (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath && m.artifact_status?.status === 'missing'))}
                       style={{ height: '38px', padding: '0 20px', display: 'flex', alignItems: 'center', gap: '8px' }}
                     >
                       {sandboxModelLoading ? "Loading..." : "Load Weights"}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={sandboxModelLoading || sandboxModelUnloading || !inferenceStatus?.model_loaded || inferenceStatus?.offline}
+                      onClick={handleUnloadModel}
+                      style={{ height: '38px', padding: '0 14px', background: 'rgba(239, 68, 68, 0.08)', color: '#fca5a5', border: '1px solid rgba(239, 68, 68, 0.2)' }}
+                    >
+                      {sandboxModelUnloading ? "Unloading..." : "Unload"}
                     </button>
                   </div>
                   
                   {/* Custom Path Input Field */}
                   {!(sandboxModelPath === 'facebook/nllb-200-distilled-600M' || 
                      sandboxModelPath === 'facebook/mbart-large-50-many-to-many-mmt' ||
-                     (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath))) && (
+                     (Array.isArray(models) && models.some(m => m && m.checkpoint_path === sandboxModelPath)) ||
+                     (Array.isArray(discoveredModelArtifacts) && discoveredModelArtifacts.some(m => m && m.checkpoint_path === sandboxModelPath))) && (
                     <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 0.8fr', gap: '12px' }}>
                       <div>
                         <label style={{ fontSize: '11px', color: '#60a5fa', display: 'block', marginBottom: '4px' }}>Hugging Face Repo ID or Disk Path</label>
                         <input 
                           type="text" 
-                          disabled={sandboxModelLoading}
+                          disabled={sandboxModelLoading || sandboxModelUnloading}
                           value={sandboxModelPath} 
                           onChange={e => setSandboxModelPath(e.target.value)} 
                           placeholder="e.g. facebook/nllb-200-distilled-1.3B"
@@ -3573,7 +3646,7 @@ export default function App() {
                         <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '4px' }}>Version Label</label>
                         <input 
                           type="text" 
-                          disabled={sandboxModelLoading}
+                          disabled={sandboxModelLoading || sandboxModelUnloading}
                           value={sandboxModelVersion} 
                           onChange={e => setSandboxModelVersion(e.target.value)} 
                           placeholder="e.g. Custom-v1"
@@ -3604,7 +3677,7 @@ export default function App() {
               <form onSubmit={handleTranslate} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', alignItems: 'center', gap: '16px' }}>
                   <select 
-                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
+                    disabled={sandboxLoading || (inferenceStatus && (inferenceStatus.offline || !inferenceStatus.model_loaded))}
                     value={sandboxRequest.src} 
                     onChange={e => setSandboxRequest({...sandboxRequest, src: e.target.value})}
                   >
@@ -3614,7 +3687,7 @@ export default function App() {
                   </select>
                   <ArrowRight size={18} color="#64748b" />
                   <select 
-                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
+                    disabled={sandboxLoading || (inferenceStatus && (inferenceStatus.offline || !inferenceStatus.model_loaded))}
                     value={sandboxRequest.tgt} 
                     onChange={e => setSandboxRequest({...sandboxRequest, tgt: e.target.value})}
                   >
@@ -3627,18 +3700,18 @@ export default function App() {
                 <div>
                   <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Input Text</label>
                   <textarea 
-                    disabled={sandboxLoading || (inferenceStatus && inferenceStatus.offline)}
+                    disabled={sandboxLoading || (inferenceStatus && (inferenceStatus.offline || !inferenceStatus.model_loaded))}
                     rows="4" 
                     value={sandboxRequest.text} 
                     onChange={e => setSandboxRequest({...sandboxRequest, text: e.target.value})} 
-                    placeholder={(inferenceStatus && inferenceStatus.offline) ? "Inference Service is offline. Start it to run translations..." : "Enter sentence to translate..."}
+                    placeholder={(inferenceStatus && inferenceStatus.offline) ? "Inference Service is offline. Start it to run translations..." : inferenceStatus && !inferenceStatus.model_loaded ? "Inference weights are unloaded. Load a model before translating..." : "Enter sentence to translate..."}
                     required
                   />
                 </div>
 
                 <button 
                   type="submit" 
-                  disabled={sandboxLoading || !sandboxRequest.text.trim() || (inferenceStatus && inferenceStatus.offline)} 
+                  disabled={sandboxLoading || !sandboxRequest.text.trim() || (inferenceStatus && (inferenceStatus.offline || !inferenceStatus.model_loaded))} 
                   style={{ width: 'fit-content', background: (inferenceStatus && inferenceStatus.offline) ? '#374151' : undefined }}
                 >
                   {sandboxLoading ? "Translating..." : "Translate"}

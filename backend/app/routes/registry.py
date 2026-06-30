@@ -10,6 +10,142 @@ router = APIRouter(prefix="/models", tags=["model_registry"])
 
 INFERENCE_SERVICE_URL = os.getenv("INFERENCE_SERVICE_URL", "http://inference:8080")
 
+def _data_dir() -> str:
+    data_dir = os.getenv("DATA_DIR", "/data")
+    if not os.path.exists("/.dockerenv") and data_dir == "/data":
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "data")
+    return data_dir
+
+def _docker_data_path(path: str) -> str:
+    data_dir = _data_dir()
+    try:
+        rel_path = os.path.relpath(path, data_dir).replace("\\", "/")
+        if not rel_path.startswith(".."):
+            return f"/data/{rel_path}"
+    except Exception:
+        pass
+    return path
+
+def _resolve_data_path(path: str) -> str:
+    if not path:
+        return path
+    normalized = path.replace("\\", "/")
+    data_dir = _data_dir()
+    if normalized.startswith("/data/"):
+        return os.path.join(data_dir, normalized.replace("/data/", "", 1))
+    return path
+
+def _checkpoint_artifact_status(model: ModelRegistry) -> dict:
+    checkpoint_path = model.checkpoint_path or ""
+    resolved_path = _resolve_data_path(checkpoint_path)
+    exists = bool(resolved_path and os.path.exists(resolved_path))
+    required_files = ["tokenizer.json"]
+
+    if exists:
+        has_adapter = os.path.exists(os.path.join(resolved_path, "adapter_config.json"))
+        full_weight_file = next(
+            (
+                name for name in ["model.safetensors", "pytorch_model.bin"]
+                if os.path.exists(os.path.join(resolved_path, name))
+            ),
+            None
+        )
+        has_full_model = full_weight_file is not None
+        if has_adapter:
+            required_files.append("adapter_model.safetensors")
+        else:
+            required_files.append(full_weight_file or "model.safetensors")
+    else:
+        has_adapter = False
+        has_full_model = False
+
+    missing_files = [
+        name for name in required_files
+        if not resolved_path or not os.path.exists(os.path.join(resolved_path, name))
+    ]
+    ctranslate2_path = None
+    ctranslate2_exists = False
+    if model.metrics and model.metrics.get("ctranslate2_path"):
+        ctranslate2_path = _resolve_data_path(model.metrics["ctranslate2_path"])
+        ctranslate2_exists = os.path.exists(os.path.join(ctranslate2_path, "model.bin"))
+
+    return {
+        "checkpoint_exists": exists,
+        "checkpoint_path": checkpoint_path,
+        "resolved_checkpoint_path": resolved_path,
+        "missing_files": missing_files,
+        "is_peft_adapter": has_adapter,
+        "has_full_model_weights": has_full_model,
+        "ctranslate2_exists": ctranslate2_exists,
+        "ctranslate2_path": ctranslate2_path,
+        "status": "available" if exists and not missing_files else "missing"
+    }
+
+def _serialize_model_with_artifact_status(model: ModelRegistry) -> dict:
+    return {
+        "id": model.id,
+        "model_name": model.model_name,
+        "version": model.version,
+        "experiment_run_id": model.experiment_run_id,
+        "dataset_version_id": model.dataset_version_id,
+        "hyperparameters": model.hyperparameters,
+        "metrics": model.metrics,
+        "checkpoint_path": model.checkpoint_path,
+        "exported_model_path": model.exported_model_path,
+        "approval_status": model.approval_status,
+        "deployment_status": model.deployment_status,
+        "created_at": model.created_at,
+        "artifact_status": _checkpoint_artifact_status(model)
+    }
+
+def _artifact_status_for_path(path: str) -> dict:
+    model_like = type("ModelLike", (), {"checkpoint_path": _docker_data_path(path), "metrics": {}})()
+    return _checkpoint_artifact_status(model_like)
+
+def _discover_model_artifacts(db: Session) -> list:
+    data_dir = _data_dir()
+    registered_paths = {
+        (_resolve_data_path(model.checkpoint_path) or "").replace("\\", "/")
+        for model in db.query(ModelRegistry).all()
+    }
+
+    def scan_root(root: str, source: str) -> list:
+        found = []
+        if not os.path.isdir(root):
+            return found
+        entries = sorted(
+            [entry for entry in os.scandir(root) if entry.is_dir()],
+            key=lambda entry: entry.stat().st_mtime
+        )
+        for idx, entry in enumerate(entries):
+            if not entry.is_dir():
+                continue
+            resolved_path = entry.path
+            if resolved_path.replace("\\", "/") in registered_paths:
+                continue
+            artifact_status = _artifact_status_for_path(resolved_path)
+            if artifact_status["status"] != "available":
+                continue
+            version = f"v1.{idx}" if source == "models" else entry.name.replace("checkpoint_epoch_", "epoch ")
+            found.append({
+                "id": f"disk-{entry.name}",
+                "model_name": "Recovered fine-tuned model" if source == "models" else "Recovered epoch checkpoint",
+                "version": version,
+                "checkpoint_path": _docker_data_path(resolved_path),
+                "source": "disk",
+                "artifact_kind": "fine_tuned_model" if source == "models" else "epoch_checkpoint",
+                "folder_name": entry.name,
+                "artifact_status": artifact_status,
+            })
+        return found
+
+    final_models = scan_root(os.path.join(data_dir, "models"), "models")
+    if final_models:
+        return sorted(final_models, key=lambda item: item["version"], reverse=True)
+
+    checkpoints = scan_root(os.path.join(data_dir, "checkpoints"), "checkpoints")
+    return sorted(checkpoints, key=lambda item: item["version"], reverse=True)
+
 def register_model_internal(db: Session, job_id: str, run_id: str, trainer_results: dict) -> ModelRegistry:
     """
     Internal helper used by training worker task to automatically register
@@ -63,7 +199,16 @@ def list_models(db: Session = Depends(get_db)):
     """
     Lists all models in the registry.
     """
-    return db.query(ModelRegistry).order_by(ModelRegistry.created_at.desc()).all()
+    models = db.query(ModelRegistry).order_by(ModelRegistry.created_at.desc()).all()
+    return [_serialize_model_with_artifact_status(model) for model in models]
+
+@router.get("/discover-artifacts")
+def discover_model_artifacts(db: Session = Depends(get_db)):
+    """
+    Lists valid model/checkpoint folders on disk that are not registered in DB.
+    These are loadable in inference but are not registry records.
+    """
+    return _discover_model_artifacts(db)
 
 @router.get("/{model_id}")
 def get_model(model_id: str, db: Session = Depends(get_db)):
@@ -73,7 +218,7 @@ def get_model(model_id: str, db: Session = Depends(get_db)):
     model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
-    return model
+    return _serialize_model_with_artifact_status(model)
 
 @router.post("/{model_id}/approve")
 def approve_model(model_id: str, db: Session = Depends(get_db)):
@@ -104,6 +249,17 @@ def deploy_model(model_id: str, engine: str = "pytorch", db: Session = Depends(g
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only manually 'Approved' models can be deployed to production inference service."
+        )
+
+    artifact_status = _checkpoint_artifact_status(model)
+    if artifact_status["status"] != "available":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Model checkpoint files are missing or incomplete. "
+                f"Missing: {artifact_status['missing_files'] or ['checkpoint folder']} "
+                f"Path: {artifact_status['checkpoint_path']}"
+            )
         )
         
     # If CTranslate2 engine is selected, ensure the model is converted
@@ -174,6 +330,17 @@ def evaluate_model_route(model_id: str, db: Session = Depends(get_db)):
     model = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+
+    artifact_status = _checkpoint_artifact_status(model)
+    if artifact_status["status"] != "available":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Model checkpoint files are missing or incomplete. "
+                f"Missing: {artifact_status['missing_files'] or ['checkpoint folder']} "
+                f"Path: {artifact_status['checkpoint_path']}"
+            )
+        )
         
     # Mark status as Evaluating
     curr_metrics = dict(model.metrics or {})
@@ -190,4 +357,3 @@ def evaluate_model_route(model_id: str, db: Session = Depends(get_db)):
     evaluate_model_task.delay(model_id)
     
     return {"status": "Evaluation started", "model_id": model_id}
-

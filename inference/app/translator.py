@@ -46,6 +46,22 @@ class TranslationEngine:
         # Load default base NLLB-200 model weights
         self.load_model("facebook/nllb-200-distilled-600M")
 
+    def unload_model(self):
+        logger.info("Unloading inference model weights from memory...")
+        self.model = None
+        self.tokenizer = None
+        self.ct_translator = None
+        self.current_engine = "none"
+        self.current_model_path = None
+        self.current_model_version = "Unloaded"
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        logger.info("Inference model weights unloaded.")
+        return True
+
     def determine_device(self) -> str:
         if self.default_device == "cpu":
             return "cpu"
@@ -169,6 +185,9 @@ class TranslationEngine:
         try:
             start_time = time.time()
             target_device = self.determine_device()
+
+            if not self.current_model_path or not self.tokenizer:
+                raise RuntimeError("No inference model is loaded. Load weights before translating.")
             
             # Determine language tags based on model class
             is_nllb = "nllb" in self.current_model_path.lower()
