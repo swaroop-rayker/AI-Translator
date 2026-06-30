@@ -37,6 +37,7 @@ celery_app.conf.update(
         "workers.tasks.process_dataset_task": {"queue": "dataset"},
         "workers.tasks.train_model_task": {"queue": "training"},
         "workers.tasks.evaluate_model_task": {"queue": "training"},
+        "workers.tasks.convert_to_ctranslate2_task": {"queue": "training"},
     },
     task_serializer="json",
     accept_content=["json"],
@@ -381,7 +382,9 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
         
         # Trigger model registration job
         from backend.app.routes.registry import register_model_internal
-        register_model_internal(db, job_id, run_id, results)
+        registered_model = register_model_internal(db, job_id, run_id, results)
+        if registered_model:
+            convert_to_ctranslate2_task.delay(registered_model.id)
         
     except Exception as e:
         logger.error(f"Training failed: {e}")
@@ -527,6 +530,93 @@ def evaluate_model_task(model_id: str):
                 db.commit()
         except Exception as db_err:
             logger.error(f"Failed to write failure status to DB: {db_err}")
+    finally:
+        db.close()
+
+
+@celery_app.task(name="workers.tasks.convert_to_ctranslate2_task")
+def convert_to_ctranslate2_task(model_id: str):
+    import json
+    import shutil
+    import tempfile
+    from sqlalchemy.orm.attributes import flag_modified
+    
+    db = SessionLocal()
+    try:
+        model_record = db.query(ModelRegistry).filter(ModelRegistry.id == model_id).first()
+        if not model_record:
+            logger.error(f"Model registry record {model_id} not found during CTranslate2 conversion.")
+            return
+            
+        checkpoint_path = model_record.checkpoint_path
+        data_dir = os.getenv("DATA_DIR", "/data")
+        
+        # Translate docker path to local path if running on host
+        if not os.path.exists(checkpoint_path):
+            rel_path = checkpoint_path.replace("/data", "")
+            checkpoint_path = os.path.join(data_dir, rel_path.lstrip("/\\"))
+            
+        ct_path = os.path.join(checkpoint_path, "ctranslate2")
+        
+        # Verify if conversion already completed
+        if os.path.exists(os.path.join(ct_path, "model.bin")):
+            logger.info(f"Model {model_id} already converted to CTranslate2.")
+            return
+            
+        os.makedirs(ct_path, exist_ok=True)
+        
+        logger.info(f"Starting CTranslate2 INT8 conversion for model {model_id}...")
+        
+        # Check if model has PEFT (LoRA/QLoRA) adapter config
+        is_peft = os.path.exists(os.path.join(checkpoint_path, "adapter_config.json"))
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            if is_peft:
+                # To convert LoRA, we must load base model and PEFT weights, merge them, and save
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+                from peft import PeftModel
+                import torch
+                
+                base_model_name = "facebook/nllb-200-distilled-600M"
+                try:
+                    with open(os.path.join(checkpoint_path, "adapter_config.json"), "r") as f:
+                        cfg = json.load(f)
+                        base_model_name = cfg.get("base_model_name_or_path", base_model_name)
+                except Exception as e:
+                    logger.warning(f"Could not read base model name from PEFT config: {e}")
+                    
+                logger.info(f"PEFT detected. Loading base model {base_model_name} and merging LoRA weights...")
+                
+                tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+                # Load on CPU for merge
+                base_model = AutoModelForSeq2SeqLM.from_pretrained(base_model_name, torch_dtype=torch.float32)
+                peft_model = PeftModel.from_pretrained(base_model, checkpoint_path)
+                
+                # Merge LoRA weights into base model layers
+                merged_model = peft_model.merge_and_unload()
+                merged_model.save_pretrained(temp_dir)
+                tokenizer.save_pretrained(temp_dir)
+                convert_source = temp_dir
+            else:
+                convert_source = checkpoint_path
+                
+            # Perform conversion using ctranslate2 API
+            import ctranslate2
+            logger.info("Serializing to CTranslate2 INT8 model format...")
+            converter = ctranslate2.converters.TransformersConverter(convert_source)
+            converter.convert(ct_path, quantization="int8", force=True)
+            
+        # Update metrics database field
+        curr_metrics = dict(model_record.metrics or {})
+        curr_metrics["ctranslate2_path"] = os.path.join(model_record.checkpoint_path, "ctranslate2").replace("\\", "/")
+        model_record.metrics = curr_metrics
+        flag_modified(model_record, "metrics")
+        db.commit()
+        
+        logger.info(f"Model {model_id} successfully converted to CTranslate2 and saved to {ct_path}")
+        
+    except Exception as e:
+        logger.error(f"CTranslate2 conversion failed for model {model_id}: {e}", exc_info=True)
     finally:
         db.close()
 

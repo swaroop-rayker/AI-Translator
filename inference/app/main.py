@@ -27,6 +27,7 @@ class TranslationRequest(BaseModel):
 class ReloadRequest(BaseModel):
     model_path: str
     model_version: str
+    engine: str = "pytorch"
 
 @app.post("/translate")
 def translate_text(request: TranslationRequest):
@@ -41,6 +42,7 @@ def translate_text(request: TranslationRequest):
         )
         return result
     except Exception as e:
+        # If detail is structured JSON error from translator, pass it through directly
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
@@ -51,7 +53,7 @@ def reload_model(request: ReloadRequest):
     """
     Forces the inference engine to load new model weights from shared disk space.
     """
-    success = translator_engine.load_model(request.model_path, request.model_version)
+    success = translator_engine.load_model(request.model_path, request.model_version, request.engine)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -60,7 +62,8 @@ def reload_model(request: ReloadRequest):
     return {
         "status": "success",
         "loaded_model_version": translator_engine.current_model_version,
-        "loaded_model_path": translator_engine.current_model_path
+        "loaded_model_path": translator_engine.current_model_path,
+        "active_engine": translator_engine.current_engine
     }
 
 @app.get("/status")
@@ -73,6 +76,7 @@ def get_inference_status():
         "model_version": translator_engine.current_model_version,
         "model_path": translator_engine.current_model_path,
         "active_device": device,
+        "active_engine": translator_engine.current_engine,
         "gpu_fallback_active": (device == "cpu" and translator_engine.default_device != "cpu")
     }
 

@@ -36,8 +36,10 @@ class StateManager:
             "Created": {"Training"},
             "Training": {"Ready", "Failed"},
             "Ready": {"Approved", "Archived"},
-            "Approved": {"Deployed", "Archived"},
-            "Deployed": {"Archived"},
+            "Approved": {"Deployed", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)", "Archived"},
+            "Deployed": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)"},
+            "Deployed (CTRANSLATE2)": {"Archived", "Deployed (PYTORCH)", "Deployed (CTRANSLATE2)"},
+            "Deployed (PYTORCH)": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)"},
             "Archived": set()
         }
     }
@@ -140,8 +142,8 @@ class StateManager:
         virtual_state = "Created"
         if model.approval_status == "Archived":
             virtual_state = "Archived"
-        elif model.deployment_status == "Deployed":
-            virtual_state = "Deployed"
+        elif model.deployment_status and model.deployment_status.startswith("Deployed"):
+            virtual_state = model.deployment_status
         elif model.approval_status == "Approved":
             virtual_state = "Approved"
         elif model.exported_model_path or model.metrics:
@@ -161,8 +163,8 @@ class StateManager:
             pass
         elif target_state == "Approved":
             model.approval_status = "Approved"
-        elif target_state == "Deployed":
-            model.deployment_status = "Deployed"
+        elif target_state.startswith("Deployed"):
+            model.deployment_status = target_state
         elif target_state == "Archived":
             model.approval_status = "Archived"
             model.deployment_status = "Undeployed"

@@ -1029,6 +1029,7 @@ export default function App() {
   const [selectedRunIds, setSelectedRunIds] = useState([]);
   const [comparison, setComparison] = useState(null);
   const [showArchived, setShowArchived] = useState(false);
+  const [modelDeployingId, setModelDeployingId] = useState(null);
 
   // Form inputs
   const [datasetName, setDatasetName] = useState('');
@@ -1064,7 +1065,12 @@ export default function App() {
   const [inferenceStatus, setInferenceStatus] = useState(null);
   const [sandboxModelPath, setSandboxModelPath] = useState('facebook/nllb-200-distilled-600M');
   const [sandboxModelVersion, setSandboxModelVersion] = useState('Base');
+  const [sandboxEngine, setSandboxEngine] = useState('ctranslate2');
   const [sandboxModelLoading, setSandboxModelLoading] = useState(false);
+  const [sandboxModelLoadStage, setSandboxModelLoadStage] = useState(null);
+  const [sandboxLoadError, setSandboxLoadError] = useState(null);
+  const [sandboxTranslateStage, setSandboxTranslateStage] = useState(null);
+  const [sandboxTranslateError, setSandboxTranslateError] = useState(null);
 
   // Fetch initial data
   const refreshAll = () => {
@@ -1428,12 +1434,23 @@ export default function App() {
     });
   };
 
-  const deployModel = (id) => {
-    fetch(`${API_URL}/api/models/${id}/deploy`, { method: 'POST' })
-    .then(r => r.json())
+  const deployModel = (id, engine = 'pytorch') => {
+    setModelDeployingId(id);
+    fetch(`${API_URL}/api/models/${id}/deploy?engine=${engine}`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) {
+        return r.json().then(err => { throw new Error(err.detail || "Deployment failed"); });
+      }
+      return r.json();
+    })
     .then(data => {
-      alert("Model Deployed to Inference Service!");
+      alert(`Model successfully deployed via ${engine.toUpperCase()} engine!`);
+      setModelDeployingId(null);
       refreshAll();
+    })
+    .catch(err => {
+      alert("Deployment failed: " + err.message);
+      setModelDeployingId(null);
     });
   };
 
@@ -1478,30 +1495,67 @@ export default function App() {
   const handleLoadModel = (e) => {
     e.preventDefault();
     if (!sandboxModelPath.trim()) return;
+    setSandboxLoadError(null);
     setSandboxModelLoading(true);
+    setSandboxModelLoadStage("Locating checkpoint folder...");
     
+    // Determine engine based on selected sandboxEngine state
+    let selectedEngine = sandboxEngine;
+    
+    // Simulate loading stages for clear user indication
+    const stages = [
+      "Locating checkpoint folder...",
+      "Clearing previous model from memory...",
+      "Loading tokenizer configurations...",
+      "Reading model weight binaries...",
+      "Performing model warm-up pass..."
+    ];
+    let currentStageIdx = 0;
+    const interval = setInterval(() => {
+      if (currentStageIdx < stages.length - 1) {
+        currentStageIdx++;
+        setSandboxModelLoadStage(stages[currentStageIdx]);
+      }
+    }, 400);
+
     fetch(`${INFERENCE_URL}/reload`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model_path: sandboxModelPath,
-        model_version: sandboxModelVersion
+        model_version: sandboxModelVersion,
+        engine: selectedEngine
       })
     })
     .then(r => {
+      clearInterval(interval);
       if (!r.ok) {
         return r.json().then(err => { throw new Error(err.detail || "Model loading failed on inference server"); });
       }
       return r.json();
     })
     .then(data => {
-      alert(`Model weights loaded successfully: ${data.loaded_model_version}`);
-      setSandboxModelLoading(false);
-      refreshAll();
+      setSandboxModelLoadStage("Atomic swap complete...");
+      setTimeout(() => {
+        setSandboxModelLoading(false);
+        setSandboxModelLoadStage(null);
+        refreshAll();
+      }, 500);
     })
     .catch(err => {
-      alert("Failed to load model: " + err.message);
+      clearInterval(interval);
+      let errMsg = err.message;
+      let errStage = stages[currentStageIdx] || "Reading model weight binaries";
+      try {
+        const parsed = JSON.parse(err.message);
+        if (parsed.stage && parsed.error) {
+          errStage = parsed.stage;
+          errMsg = parsed.error;
+        }
+      } catch(e) {}
+      setSandboxLoadError({ stage: errStage, message: errMsg });
       setSandboxModelLoading(false);
+      setSandboxModelLoadStage(null);
     });
   };
 
@@ -1510,8 +1564,27 @@ export default function App() {
     e.preventDefault();
     if (!sandboxRequest.text.trim()) return;
     setSandboxLoading(true);
-    setSandboxResult(null); // Clear previous result to show clean state
-    
+    setSandboxResult(null);
+    setSandboxTranslateError(null);
+    setSandboxTranslateStage("Initializing HTTP connection...");
+
+    const stages = [
+      "Initializing HTTP connection...",
+      "Resolving GPU locks...",
+      "Tokenizing source text...",
+      "Injecting language tags...",
+      "Running auto-regressive decoding...",
+      "Decoding output tokens...",
+      "Finalizing translation..."
+    ];
+    let currentStageIdx = 0;
+    const interval = setInterval(() => {
+      if (currentStageIdx < stages.length - 1) {
+        currentStageIdx++;
+        setSandboxTranslateStage(stages[currentStageIdx]);
+      }
+    }, 200);
+
     fetch(`${INFERENCE_URL}/translate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1522,18 +1595,34 @@ export default function App() {
       })
     })
     .then(r => {
+      clearInterval(interval);
       if (!r.ok) {
-        return r.json().then(err => { throw new Error(err.detail || "Translation execution failed on server"); });
+        return r.json().then(err => { 
+          throw new Error(err.detail || "Translation execution failed on server"); 
+        });
       }
       return r.json();
     })
     .then(data => {
       setSandboxResult(data);
       setSandboxLoading(false);
+      setSandboxTranslateStage(null);
     })
     .catch(err => {
-      setSandboxResult({ error: err.message || "Translation request failed. Make sure inference service is online." });
+      clearInterval(interval);
+      let errMsg = err.message;
+      let errStage = stages[currentStageIdx] || "Running auto-regressive decoding";
+      try {
+        const parsed = JSON.parse(err.message);
+        if (parsed.stage && parsed.error) {
+          errStage = parsed.stage;
+          errMsg = parsed.error;
+        }
+      } catch (e) {}
+      
+      setSandboxTranslateError({ stage: errStage, message: errMsg });
       setSandboxLoading(false);
+      setSandboxTranslateStage(null);
     });
   };
 
@@ -3124,7 +3213,7 @@ export default function App() {
                           <span className={`badge ${m.approval_status === 'Approved' ? 'success' : 'warning'}`}>{m.approval_status}</span>
                         </td>
                         <td style={{ padding: '12px' }}>
-                          <span className={`badge ${m.deployment_status === 'Deployed' ? 'info' : 'muted'}`}>{m.deployment_status}</span>
+                          <span className={`badge ${m.deployment_status?.startsWith('Deployed') ? 'info' : 'muted'}`}>{m.deployment_status}</span>
                         </td>
                         <td style={{ padding: '12px', textAlign: 'right', display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
                           {m.metrics?.evaluation_status === 'Evaluating' ? (
@@ -3142,8 +3231,31 @@ export default function App() {
                           {m.approval_status === 'Pending' && (
                             <button style={{ padding: '6px 12px', fontSize: '12px', background: 'var(--color-success)' }} onClick={() => approveModel(m.id)}>Approve</button>
                           )}
-                          {m.approval_status === 'Approved' && m.deployment_status === 'Undeployed' && (
-                            <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px' }} onClick={() => deployModel(m.id)}>Deploy</button>
+                          {m.approval_status === 'Approved' && (
+                            modelDeployingId === m.id ? (
+                              <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px', color: '#60a5fa' }} disabled>⏳ Deploying...</button>
+                            ) : (
+                              <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                                <select 
+                                  id={`deploy-engine-${m.id}`}
+                                  defaultValue={m.deployment_status?.includes('PYTORCH') ? 'pytorch' : 'ctranslate2'} 
+                                  style={{ padding: '4px 6px', fontSize: '12px', color: '#e2e8f0', background: 'rgba(30, 41, 59, 0.5)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', height: '30px', cursor: 'pointer' }}
+                                >
+                                  <option value="ctranslate2">CTranslate2</option>
+                                  <option value="pytorch">PyTorch</option>
+                                </select>
+                                <button 
+                                  className="secondary" 
+                                  style={{ padding: '6px 12px', fontSize: '12px', background: 'rgba(16, 185, 129, 0.1)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.2)' }} 
+                                  onClick={() => {
+                                    const engine = document.getElementById(`deploy-engine-${m.id}`).value;
+                                    deployModel(m.id, engine);
+                                  }}
+                                >
+                                  {m.deployment_status?.startsWith('Deployed') ? 'Redeploy' : 'Deploy'}
+                                </button>
+                              </div>
+                            )
                           )}
                         </td>
                       </tr>
@@ -3172,7 +3284,10 @@ export default function App() {
                       <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
                         Active: <strong style={{ color: '#e2e8f0' }}>{inferenceStatus.model_version || 'Base'}</strong>
                       </span>
-                      <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                      <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
+                        Engine: <strong style={{ color: '#fbbf24', textTransform: 'uppercase' }}>{inferenceStatus.active_engine || 'pytorch'}</strong>
+                      </span>
+                      <span style={{ fontSize: '11px', color: '#94a3b8', marginLeft: '6px' }}>
                         Device: <strong style={{ color: '#22d3ee' }}>{(inferenceStatus.active_device || 'cpu').toUpperCase()}</strong>
                       </span>
                       {inferenceStatus?.gpu_fallback_active && (
@@ -3187,7 +3302,7 @@ export default function App() {
               <div style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid rgba(255,255,255,0.05)', padding: '16px', borderRadius: '8px', marginBottom: '24px' }}>
                 <h5 style={{ fontSize: '13px', fontWeight: 600, color: '#e2e8f0', marginBottom: '12px' }}>Active Sandbox Inference Model</h5>
                 <form onSubmit={handleLoadModel} style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'flex-end', gap: '16px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', alignItems: 'flex-end', gap: '16px' }}>
                     <div style={{ flexGrow: 1 }}>
                       <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Select Model or Checkpoint</label>
                       <select 
@@ -3209,6 +3324,13 @@ export default function App() {
                             // Find version matching checkpoint_path in models
                             const matchedModel = Array.isArray(models) ? models.find(m => m && m.checkpoint_path === val) : null;
                             setSandboxModelVersion(matchedModel ? matchedModel.version : 'Base');
+                            if (matchedModel && matchedModel.deployment_status) {
+                              if (matchedModel.deployment_status.includes('CTRANSLATE2')) {
+                                setSandboxEngine('ctranslate2');
+                              } else if (matchedModel.deployment_status.includes('PYTORCH')) {
+                                setSandboxEngine('pytorch');
+                              }
+                            }
                           }
                         }}
                       >
@@ -3230,10 +3352,22 @@ export default function App() {
                         </optgroup>
                       </select>
                     </div>
+                    <div>
+                      <label style={{ fontSize: '11px', color: '#94a3b8', display: 'block', marginBottom: '6px' }}>Serving Engine</label>
+                      <select 
+                        disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline)}
+                        value={sandboxEngine} 
+                        onChange={e => setSandboxEngine(e.target.value)}
+                        style={{ height: '38px', padding: '0 10px', fontSize: '13px', color: '#e2e8f0', background: 'rgba(30, 41, 59, 0.5)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', cursor: 'pointer' }}
+                      >
+                        <option value="ctranslate2">CTranslate2</option>
+                        <option value="pytorch">PyTorch</option>
+                      </select>
+                    </div>
                     <button 
                       type="submit" 
                       className="secondary" 
-                      disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline) || (inferenceStatus && inferenceStatus.model_path === sandboxModelPath)}
+                      disabled={sandboxModelLoading || (inferenceStatus && inferenceStatus.offline) || (inferenceStatus && inferenceStatus.model_path === sandboxModelPath && inferenceStatus.active_engine === sandboxEngine)}
                       style={{ height: '38px', padding: '0 20px', display: 'flex', alignItems: 'center', gap: '8px' }}
                     >
                       {sandboxModelLoading ? "Loading..." : "Load Weights"}
@@ -3270,6 +3404,22 @@ export default function App() {
                     </div>
                   )}
                 </form>
+                
+                {sandboxModelLoadStage && (
+                  <div style={{ marginTop: '12px', background: 'rgba(251, 191, 36, 0.05)', borderLeft: '3px solid #fbbf24', padding: '10px 14px', borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{ width: '10px', height: '10px', borderRadius: '50%', background: '#fbbf24', animation: 'pulse 1.2s ease-in-out infinite' }} />
+                    <span style={{ fontSize: '12px', color: '#fbbf24', fontWeight: 550 }}>{sandboxModelLoadStage}</span>
+                  </div>
+                )}
+                {sandboxLoadError && (
+                  <div style={{ marginTop: '12px', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.2)', padding: '12px', borderRadius: '6px', color: '#fca5a5', display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '12px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600 }}>
+                      <AlertCircle size={14} style={{ flexShrink: 0 }} />
+                      <span>Load Failed at stage: "{sandboxLoadError.stage}"</span>
+                    </div>
+                    <div style={{ color: '#cbd5e1', fontSize: '11px', paddingLeft: '20px', fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>{sandboxLoadError.message}</div>
+                  </div>
+                )}
               </div>
 
               <form onSubmit={handleTranslate} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -3320,7 +3470,21 @@ export default function App() {
                 <div className="glass-panel" style={{ marginTop: '24px', background: 'rgba(255,255,255,0.01)', borderLeft: '3px solid var(--color-primary)' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                     <div style={{ width: '12px', height: '12px', borderRadius: '50%', border: '2px solid rgba(255,255,255,0.1)', borderTopColor: '#60a5fa', animation: 'spin 1s linear infinite' }}></div>
-                    <span style={{ fontSize: '13px', color: '#94a3b8' }}>Running forward inference pass through model layers...</span>
+                    <span style={{ fontSize: '13px', color: '#60a5fa', fontWeight: 550 }}>
+                      {sandboxTranslateStage || "Running forward inference pass through model layers..."}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {sandboxTranslateError && (
+                <div className="glass-panel" style={{ marginTop: '24px', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.2)' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', color: '#fca5a5', fontSize: '13px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 600 }}>
+                      <AlertCircle size={16} style={{ flexShrink: 0 }} />
+                      <span>Inference Failed at stage: "{sandboxTranslateError.stage}"</span>
+                    </div>
+                    <div style={{ color: '#cbd5e1', fontSize: '12px', paddingLeft: '24px', fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>{sandboxTranslateError.message}</div>
                   </div>
                 </div>
               )}
@@ -3337,8 +3501,9 @@ export default function App() {
                     <div>
                       <p style={{ fontSize: '18px', fontWeight: 600, color: 'var(--color-secondary)' }}>{sandboxResult.translated_text}</p>
                       <div style={{ display: 'flex', gap: '16px', marginTop: '16px', fontSize: '11px', color: '#64748b' }}>
-                        <span>Latency: <strong>{sandboxResult.latency_ms} ms</strong></span>
-                        <span>Device: <strong>{sandboxResult.device}</strong></span>
+                        <span>Engine: <strong style={{ color: '#fbbf24', textTransform: 'uppercase' }}>{sandboxResult.engine || 'pytorch'}</strong></span>
+                        <span>Inference Latency: <strong>{sandboxResult.latency_ms} ms</strong></span>
+                        <span>Device: <strong>{(sandboxResult.device || 'cpu').toUpperCase()}</strong></span>
                         <span>Model: <strong>{sandboxResult.model_version}</strong></span>
                       </div>
                     </div>

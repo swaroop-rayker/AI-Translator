@@ -91,7 +91,7 @@ def approve_model(model_id: str, db: Session = Depends(get_db)):
     }
 
 @router.post("/{model_id}/deploy")
-def deploy_model(model_id: str, db: Session = Depends(get_db)):
+def deploy_model(model_id: str, engine: str = "pytorch", db: Session = Depends(get_db)):
     """
     Deploys a model to the inference service.
     Updates the registry deployment statuses and triggers Inference reload.
@@ -106,24 +106,56 @@ def deploy_model(model_id: str, db: Session = Depends(get_db)):
             detail="Only manually 'Approved' models can be deployed to production inference service."
         )
         
-    # Undeploy all currently deployed models
-    currently_deployed = db.query(ModelRegistry).filter(ModelRegistry.deployment_status == "Deployed").all()
+    # If CTranslate2 engine is selected, ensure the model is converted
+    if engine == "ctranslate2":
+        ct_converted = False
+        if model.metrics and "ctranslate2_path" in model.metrics:
+            data_dir = os.getenv("DATA_DIR", "/data")
+            ct_path = model.metrics["ctranslate2_path"]
+            if ct_path.startswith("/data"):
+                # Translate docker path to local path for verification if running on host
+                if not os.path.exists(ct_path):
+                    rel_path = ct_path.replace("/data", "")
+                    ct_path = os.path.join(data_dir, rel_path.lstrip("/\\"))
+            if os.path.exists(os.path.join(ct_path, "model.bin")):
+                ct_converted = True
+                
+        if not ct_converted:
+            from workers.tasks import convert_to_ctranslate2_task
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Model {model_id} not converted to CTranslate2 yet. Triggering conversion task on Celery worker...")
+            try:
+                task = convert_to_ctranslate2_task.delay(model_id)
+                task.get(timeout=60.0) # Wait for Celery worker to finish
+                db.refresh(model)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"CTranslate2 conversion failed on task execution: {str(e)}"
+                )
+                
+    # Undeploy all currently deployed models (excluding the one being redeployed/switched)
+    currently_deployed = db.query(ModelRegistry).filter(
+        ModelRegistry.deployment_status.like("Deployed%"),
+        ModelRegistry.id != model_id
+    ).all()
     for m in currently_deployed:
         m.deployment_status = "Undeployed"
         StateManager.transition_model(db, m, "Archived", "Undeployed in favor of new model")
         
     # Deploy this model
-    StateManager.transition_model(db, model, "Deployed", "Production Deployment")
+    deployment_label = f"Deployed ({engine.upper()})"
+    StateManager.transition_model(db, model, deployment_label, f"Production Deployment using {engine.upper()} engine")
     
     # Notify Inference service to reload weights
     try:
-        # Convert container path to relative or shared host volume path if applicable
-        # Our containers share /data volume directly, so the path "/data/models/..." is identical!
         payload = {
             "model_path": model.checkpoint_path,
-            "model_version": model.version
+            "model_version": model.version,
+            "engine": engine
         }
-        res = requests.post(f"{INFERENCE_SERVICE_URL}/reload", json=payload, timeout=10)
+        res = requests.post(f"{INFERENCE_SERVICE_URL}/reload", json=payload, timeout=15)
         inference_status = res.json() if res.status_code == 200 else {"error": res.text}
     except Exception as e:
         inference_status = {"error": f"Failed to notify inference service: {str(e)}"}
