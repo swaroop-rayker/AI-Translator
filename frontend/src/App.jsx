@@ -1026,6 +1026,45 @@ export default function App() {
   const activeTrainingJob = Array.isArray(jobs) ? jobs.find(j => j && j.job_type === 'training' && (j.status === 'Running' || j.status === 'Starting' || j.status === 'Queued' || j.status === 'Paused')) : null;
   const [experiments, setExperiments] = useState([]);
   const [models, setModels] = useState([]);
+  const [mockModels, setMockModels] = useState([
+    {
+      id: 'mock-1',
+      model_name: 'translation-model-en-kn',
+      version: 'v1.0',
+      metrics: { final_loss: 0.15, model_size_mb: 836 },
+      approval_status: 'Approved',
+      deployment_status: 'Deployed (CTRANSLATE2)'
+    },
+    {
+      id: 'mock-2',
+      model_name: 'translation-model-en-ml',
+      version: 'v1.1',
+      metrics: { final_loss: 0.28, model_size_mb: 836 },
+      approval_status: 'Pending',
+      deployment_status: 'Undeployed'
+    }
+  ]);
+
+  const approveMockModel = (id) => {
+    setMockModels(prev => prev.map(m => m.id === id ? { ...m, approval_status: 'Approved' } : m));
+    alert("Model Approved!");
+  };
+
+  const deployMockModel = (id, engine) => {
+    setModelDeployingId(id);
+    setTimeout(() => {
+      setMockModels(prev => prev.map(m => {
+        if (m.id === id) {
+          return { ...m, deployment_status: `Deployed (${engine.toUpperCase()})` };
+        } else {
+          return { ...m, deployment_status: 'Undeployed' };
+        }
+      }));
+      setModelDeployingId(null);
+      alert(`Model successfully deployed via ${engine.toUpperCase()} engine!`);
+    }, 800);
+  };
+
   const [selectedRunIds, setSelectedRunIds] = useState([]);
   const [comparison, setComparison] = useState(null);
   const [showArchived, setShowArchived] = useState(false);
@@ -1255,6 +1294,22 @@ export default function App() {
     .catch(err => alert("Failed to cancel job: " + err.message));
   };
 
+  // Remove job completely from queue and database logs
+  const removeJob = (jobId) => {
+    if (!window.confirm("Are you sure you want to remove this training process from the queue completely? This will cancel it (if running) and delete all associated database records and logs.")) {
+      return;
+    }
+    fetch(`${API_URL}/api/jobs/${jobId}/remove`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to remove job");
+      return r.json();
+    })
+    .then(() => {
+      refreshAll();
+    })
+    .catch(err => alert("Failed to remove job: " + err.message));
+  };
+
   // Pause training job
   const pauseJob = (jobId) => {
     fetch(`${API_URL}/api/jobs/${jobId}/pause`, { method: 'POST' })
@@ -1309,6 +1364,39 @@ export default function App() {
       refreshAll();
     })
     .catch(err => alert("Failed to purge runs: " + err.message));
+  };
+
+  // Delete all tasks in Celery monitor
+  const deleteAllJobs = () => {
+    if (!window.confirm("Are you sure you want to delete ALL jobs and experiment runs? This will cancel any active tasks, release GPU locks, and completely clear database queues and logs.")) {
+      return;
+    }
+    fetch(`${API_URL}/api/jobs/delete-all`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to delete all jobs");
+      return r.json();
+    })
+    .then(data => {
+      alert(data.message || "All platform tasks successfully cleared.");
+      refreshAll();
+    })
+    .catch(err => alert("Failed to clear tasks: " + err.message));
+  };
+
+  // Delete single experiment run (cascades to associated job if active/queued)
+  const deleteRun = (runId) => {
+    if (!window.confirm("Are you sure you want to delete this experiment run record? If it is queued or running, it will also stop its active job.")) {
+      return;
+    }
+    fetch(`${API_URL}/api/experiments/${runId}/delete`, { method: 'POST' })
+    .then(r => {
+      if (!r.ok) throw new Error("Failed to delete run");
+      return r.json();
+    })
+    .then(() => {
+      refreshAll();
+    })
+    .catch(err => alert("Failed to delete run: " + err.message));
   };
 
   // Trigger Validation
@@ -2414,12 +2502,34 @@ export default function App() {
                       );
                     })()}
 
-                    {activeConsoleTab === 'celery' && (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#64748b', paddingBottom: '4px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
-                          <span>Celery Task Queue</span>
-                          <span>Active: {jobs.filter(j => j && j.status === 'Running').length}</span>
-                        </div>
+                     {activeConsoleTab === 'celery' && (
+                       <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', color: '#64748b', paddingBottom: '4px', borderBottom: '1px solid rgba(255,255,255,0.03)' }}>
+                           <span>Celery Task Queue</span>
+                           <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                             <span>Active: {jobs.filter(j => j && j.status === 'Running').length}</span>
+                             {jobs.length > 0 && (
+                               <button 
+                                 className="secondary" 
+                                 style={{ 
+                                   padding: '2px 8px', 
+                                   fontSize: '10px', 
+                                   background: 'rgba(239, 68, 68, 0.08)', 
+                                   color: '#fca5a5', 
+                                   border: '1px solid rgba(239, 68, 68, 0.2)',
+                                   borderRadius: '4px',
+                                   cursor: 'pointer',
+                                   height: '22px',
+                                   margin: 0,
+                                   width: 'auto'
+                                 }} 
+                                 onClick={deleteAllJobs}
+                               >
+                                 🗑️ Delete All Tasks
+                               </button>
+                             )}
+                           </div>
+                         </div>
                         {!Array.isArray(jobs) || jobs.length === 0 ? (
                           <p style={{ color: '#64748b', fontSize: '12px', textAlign: 'center', marginTop: '20px' }}>No active or completed background tasks.</p>
                         ) : (
@@ -2456,12 +2566,36 @@ export default function App() {
                                       {j.created_at ? new Date(j.created_at).toLocaleTimeString() : 'N/A'}
                                     </td>
                                     <td style={{ padding: '8px 4px', textAlign: 'right' }}>
-                                      {(j.status === 'Running' || j.status === 'Starting' || j.status === 'Queued' || j.status === 'Paused') && (
+                                      <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
+                                        {(j.status === 'Running' || j.status === 'Starting' || j.status === 'Queued' || j.status === 'Paused') && (
+                                          <button 
+                                            style={{ 
+                                              background: 'rgba(239, 68, 68, 0.08)', 
+                                              color: '#fca5a5', 
+                                              border: '1px solid rgba(239, 68, 68, 0.15)', 
+                                              padding: '2px 6px', 
+                                              fontSize: '10px', 
+                                              borderRadius: '4px',
+                                              cursor: 'pointer',
+                                              boxShadow: 'none',
+                                              width: 'auto',
+                                              margin: 0
+                                            }}
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              if (window.confirm("Are you sure you want to cancel this job?")) {
+                                                cancelJob(j.id);
+                                              }
+                                            }}
+                                          >
+                                            Cancel
+                                          </button>
+                                        )}
                                         <button 
                                           style={{ 
-                                            background: 'rgba(239, 68, 68, 0.1)', 
-                                            color: '#fca5a5', 
-                                            border: '1px solid rgba(239, 68, 68, 0.2)', 
+                                            background: 'rgba(244, 63, 94, 0.12)', 
+                                            color: '#fb7185', 
+                                            border: '1px solid rgba(244, 63, 94, 0.2)', 
                                             padding: '2px 6px', 
                                             fontSize: '10px', 
                                             borderRadius: '4px',
@@ -2472,17 +2606,12 @@ export default function App() {
                                           }}
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            const confirmMsg = j.status === 'Queued' 
-                                              ? "Are you sure you want to remove this job from the queue?" 
-                                              : "Are you sure you want to cancel this job?";
-                                            if (window.confirm(confirmMsg)) {
-                                              cancelJob(j.id);
-                                            }
+                                            removeJob(j.id);
                                           }}
                                         >
-                                          {j.status === 'Queued' ? 'Remove' : 'Cancel'}
+                                          Remove
                                         </button>
-                                      )}
+                                      </div>
                                     </td>
                                   </tr>
                                 ))}
@@ -3085,9 +3214,31 @@ export default function App() {
                         <div key={run.id} className="glass-panel" style={{ padding: '16px', background: 'rgba(255,255,255,0.01)', borderLeft: isActiveRun ? '3px solid var(--color-primary)' : undefined }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                             <span style={{ fontWeight: 600 }}>{run.run_name}</span>
-                            <span className={`badge ${run.status === 'Completed' ? 'success' : run.status === 'Failed' ? 'danger' : 'info'}`}>
-                              {isActiveRun ? activeTrainingJob.status : run.status}
-                            </span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span className={`badge ${run.status === 'Completed' ? 'success' : run.status === 'Failed' ? 'danger' : 'info'}`}>
+                                {isActiveRun ? activeTrainingJob.status : run.status}
+                              </span>
+                              <button 
+                                style={{ 
+                                  background: 'rgba(239, 68, 68, 0.05)', 
+                                  color: '#fca5a5', 
+                                  border: '1px solid rgba(239, 68, 68, 0.15)',
+                                  padding: '2px 6px',
+                                  fontSize: '9px',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  width: 'auto',
+                                  margin: 0,
+                                  boxShadow: 'none'
+                                }}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  deleteRun(run.id);
+                                }}
+                              >
+                                Delete
+                              </button>
+                            </div>
                           </div>
                           <p style={{ fontSize: '12px', color: '#64748b', marginTop: '6px' }}>
                             Technique: <strong style={{ color: '#60a5fa' }}>{(run.hyperparameters?.training_technique || 'full').toUpperCase()}</strong> | Epochs: {run.hyperparameters?.epochs} | Batch: {run.hyperparameters?.batch_size} | LR: {run.hyperparameters?.learning_rate}
@@ -3144,29 +3295,53 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
-                        <td style={{ padding: '12px', fontSize: '14px', fontWeight: 550 }}>translation-model-en-kn</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>v1.0</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>0.15</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>836 MB</td>
-                        <td style={{ padding: '12px' }}><span className="badge success">Approved</span></td>
-                        <td style={{ padding: '12px' }}><span className="badge info">Deployed</span></td>
-                        <td style={{ padding: '12px', textAlign: 'right' }}>
-                          <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px' }} disabled>Deploy Active</button>
-                        </td>
-                      </tr>
-                      <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
-                        <td style={{ padding: '12px', fontSize: '14px', fontWeight: 550 }}>translation-model-en-ml</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>v1.1</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>0.28</td>
-                        <td style={{ padding: '12px', fontSize: '13px' }}>836 MB</td>
-                        <td style={{ padding: '12px' }}><span className="badge warning">Pending</span></td>
-                        <td style={{ padding: '12px' }}><span className="badge muted">Undeployed</span></td>
-                        <td style={{ padding: '12px', textAlign: 'right', display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-                          <button style={{ padding: '6px 12px', fontSize: '12px', background: 'var(--color-success)' }} onClick={() => alert("Model Approved!")}>Approve</button>
-                          <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px' }} onClick={() => alert("Approved model deployed!")}>Deploy</button>
-                        </td>
-                      </tr>
+                      {mockModels.map(m => (
+                        <tr key={m.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.02)' }}>
+                          <td style={{ padding: '12px', fontSize: '14px', fontWeight: 550 }}>{m.model_name}</td>
+                          <td style={{ padding: '12px', fontSize: '13px' }}>{m.version}</td>
+                          <td style={{ padding: '12px', fontSize: '13px' }}>{m.metrics.final_loss}</td>
+                          <td style={{ padding: '12px', fontSize: '13px' }}>{m.metrics.model_size_mb} MB</td>
+                          <td style={{ padding: '12px' }}>
+                            <span className={`badge ${m.approval_status === 'Approved' ? 'success' : 'warning'}`}>{m.approval_status}</span>
+                          </td>
+                          <td style={{ padding: '12px' }}>
+                            <span className={`badge ${m.deployment_status.startsWith('Deployed') ? 'info' : 'muted'}`}>{m.deployment_status}</span>
+                          </td>
+                          <td style={{ padding: '12px', textAlign: 'right' }}>
+                            <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
+                              {m.approval_status === 'Pending' && (
+                                <button style={{ padding: '6px 12px', fontSize: '12px', background: 'var(--color-success)' }} onClick={() => approveMockModel(m.id)}>Approve</button>
+                              )}
+                              {m.approval_status === 'Approved' && (
+                                modelDeployingId === m.id ? (
+                                  <button className="secondary" style={{ padding: '6px 12px', fontSize: '12px', color: '#60a5fa' }} disabled>⏳ Deploying...</button>
+                                ) : (
+                                  <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                                    <select 
+                                      id={`deploy-engine-${m.id}`}
+                                      defaultValue={m.deployment_status.includes('PYTORCH') ? 'pytorch' : 'ctranslate2'} 
+                                      style={{ padding: '4px 6px', fontSize: '12px', color: '#e2e8f0', background: 'rgba(30, 41, 59, 0.5)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px', height: '30px', cursor: 'pointer' }}
+                                    >
+                                      <option value="ctranslate2">CTranslate2</option>
+                                      <option value="pytorch">PyTorch</option>
+                                    </select>
+                                    <button 
+                                      className="secondary" 
+                                      style={{ padding: '6px 12px', fontSize: '12px', background: 'rgba(16, 185, 129, 0.1)', color: '#34d399', border: '1px solid rgba(16, 185, 129, 0.2)' }} 
+                                      onClick={() => {
+                                        const engine = document.getElementById(`deploy-engine-${m.id}`).value;
+                                        deployMockModel(m.id, engine);
+                                      }}
+                                    >
+                                      {m.deployment_status?.startsWith('Deployed') ? 'Redeploy' : 'Deploy'}
+                                    </button>
+                                  </div>
+                                )
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>

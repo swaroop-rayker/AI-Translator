@@ -141,8 +141,7 @@ def deploy_model(model_id: str, engine: str = "pytorch", db: Session = Depends(g
         ModelRegistry.id != model_id
     ).all()
     for m in currently_deployed:
-        m.deployment_status = "Undeployed"
-        StateManager.transition_model(db, m, "Archived", "Undeployed in favor of new model")
+        StateManager.transition_model(db, m, "Approved", "Undeployed in favor of new model")
         
     # Deploy this model
     deployment_label = f"Deployed ({engine.upper()})"

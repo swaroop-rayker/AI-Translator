@@ -37,9 +37,9 @@ class StateManager:
             "Training": {"Ready", "Failed"},
             "Ready": {"Approved", "Archived"},
             "Approved": {"Deployed", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)", "Archived"},
-            "Deployed": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)"},
-            "Deployed (CTRANSLATE2)": {"Archived", "Deployed (PYTORCH)", "Deployed (CTRANSLATE2)"},
-            "Deployed (PYTORCH)": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)"},
+            "Deployed": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)", "Approved"},
+            "Deployed (CTRANSLATE2)": {"Archived", "Deployed (PYTORCH)", "Deployed (CTRANSLATE2)", "Approved"},
+            "Deployed (PYTORCH)": {"Archived", "Deployed (CTRANSLATE2)", "Deployed (PYTORCH)", "Approved"},
             "Archived": set()
         }
     }
@@ -163,6 +163,7 @@ class StateManager:
             pass
         elif target_state == "Approved":
             model.approval_status = "Approved"
+            model.deployment_status = "Undeployed"
         elif target_state.startswith("Deployed"):
             model.deployment_status = target_state
         elif target_state == "Archived":

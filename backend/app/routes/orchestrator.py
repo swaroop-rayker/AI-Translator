@@ -303,6 +303,129 @@ def cancel_job(job_id: str, db: Session = Depends(get_db)):
     
     return {"status": "Cancelled", "job_id": job_id}
 
+@router.post("/{job_id}/remove")
+def remove_job(job_id: str, db: Session = Depends(get_db)):
+    """
+    Cancels and deletes a training process/job completely from the database/queue.
+    Releases all locks, deletes associated experiment run logs, and cleans files.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # Log transition in state transition history before deleting
+    try:
+        from backend.app.models.schemas import StateTransition
+        transition = StateTransition(
+            entity_type="training_job",
+            entity_id=job_id,
+            from_state=job.status,
+            to_state="Removed",
+            trigger_action="Job and experiment run removed completely by developer"
+        )
+        db.add(transition)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log remove transition: {e}")
+
+    # 1. Cancel if still active
+    if job.status not in ["Completed", "Failed", "Cancelled"]:
+        if job.celery_task_id:
+            try:
+                from workers.tasks import celery_app
+                celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+            except Exception as e:
+                logger.warning(f"Failed to revoke celery task {job.celery_task_id}: {e}")
+                
+        if job.job_type == "training":
+            try:
+                gpu_scheduler.release_gpu_lock(job_id)
+            except Exception as e:
+                logger.warning(f"Failed to release GPU lock: {e}")
+                
+            data_dir = os.getenv("DATA_DIR", "/data")
+            if not os.path.exists("/.dockerenv") and data_dir == "/data":
+                data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data")
+            pause_dir = os.path.join(data_dir, "checkpoints", f"pause_{job_id}")
+            if os.path.exists(pause_dir):
+                try:
+                    shutil.rmtree(pause_dir)
+                except Exception as pe:
+                    logger.warning(f"Failed to delete paused checkpoint: {pe}")
+                    
+            # Rollback dataset status to allow training again
+            try:
+                dataset_ver_id = job.config.get("dataset_version_id")
+                if dataset_ver_id:
+                    dataset_version = db.query(DatasetVersion).filter(DatasetVersion.id == dataset_ver_id).first()
+                    if dataset_version and dataset_version.status == "TrainingUsed":
+                        StateManager.transition_dataset(db, dataset_version, "TrainReady", "Training run removed. Rolled back state.")
+            except Exception as e:
+                logger.warning(f"Failed to rollback dataset: {e}")
+
+    # 2. Delete associated ExperimentRun
+    try:
+        run = db.query(ExperimentRun).filter(ExperimentRun.run_name.like(f"run-{job_id[:8]}%")).first()
+        if run:
+            # Check if there is an associated ModelRegistry record and delete it
+            db.query(ModelRegistry).filter(ModelRegistry.experiment_run_id == run.id).delete()
+            db.delete(run)
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to delete experiment run: {e}")
+
+    # 3. Delete the Job itself
+    db.delete(job)
+    db.commit()
+    
+    return {"message": "Job and associated logs successfully removed completely."}
+
+@router.post("/delete-all")
+def delete_all_jobs(db: Session = Depends(get_db)):
+    """
+    Cancels all active jobs (revokes celery tasks, releases locks) and deletes all jobs from the database.
+    Also deletes all associated experiment run logs and model registries.
+    """
+    # 1. Cancel and release lock for all active jobs
+    active_jobs = db.query(Job).filter(Job.status.in_(["Queued", "Running", "Paused", "Starting"])).all()
+    for job in active_jobs:
+        if job.celery_task_id:
+            try:
+                from workers.tasks import celery_app
+                celery_app.control.revoke(job.celery_task_id, terminate=True, signal="SIGTERM")
+            except Exception:
+                pass
+        if job.job_type == "training":
+            try:
+                gpu_scheduler.release_gpu_lock(job.id)
+            except Exception:
+                pass
+                
+    # 2. Revert any dataset version statuses
+    for job in active_jobs:
+        try:
+            dataset_ver_id = job.config.get("dataset_version_id")
+            if dataset_ver_id:
+                dataset_version = db.query(DatasetVersion).filter(DatasetVersion.id == dataset_ver_id).first()
+                if dataset_version and dataset_version.status == "TrainingUsed":
+                    dataset_version.status = "TrainReady"
+        except Exception:
+            pass
+
+    # 3. Delete all ModelRegistry records linked to experiment runs first
+    db.query(ModelRegistry).delete()
+    db.commit()
+
+    # 4. Delete all ExperimentRun records
+    db.query(ExperimentRun).delete()
+    db.commit()
+
+    # 5. Delete all Job records
+    num_deleted = db.query(Job).delete()
+    db.commit()
+    
+    return {"message": "All celery tasks, database jobs, and experiment runs successfully deleted.", "deleted_count": num_deleted}
+
 @router.post("/{job_id}/reset")
 def reset_failed_job(job_id: str, db: Session = Depends(get_db)):
     """
