@@ -126,6 +126,8 @@ function TrainingProgressPanel({ progress, jobStatus, errorLog, isCompact = fals
     { key: 'preprocessing_dataset', label: 'Tokenize' },
     { key: 'loading_model', label: 'VRAM Load' },
     { key: 'training', label: 'Training' },
+    { key: 'validating', label: 'Validate' },
+    { key: 'checkpointing', label: 'Checkpoint' },
     { key: 'finalizing', label: 'Finalize' }
   ];
 
@@ -138,6 +140,8 @@ function TrainingProgressPanel({ progress, jobStatus, errorLog, isCompact = fals
   let totalPercent = 0;
   if (currentStage === 'queue') {
     totalPercent = 0;
+  } else if (['training', 'validating', 'checkpointing'].includes(currentStage)) {
+    totalPercent = Math.min(100, Math.max(0, Math.round(stageProgress || 0)));
   } else if (activeIdx >= 0) {
     const basePercent = (activeIdx / stages.length) * 100;
     const currentShare = (stageProgress / stages.length);
@@ -229,7 +233,7 @@ function TrainingProgressPanel({ progress, jobStatus, errorLog, isCompact = fals
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
           <div>
             <span className={`badge ${currentStage === 'queue' ? 'warning' : 'info'}`} style={{ textTransform: 'uppercase', fontSize: '8.5px', fontWeight: 700, padding: '1px 5px', letterSpacing: '0.05em' }}>
-              {currentStage.replace('_', ' ')}
+              {currentStage.replaceAll('_', ' ')}
             </span>
             <div style={{ fontSize: '11.5px', color: '#e2e8f0', marginTop: '4px', fontWeight: 500, lineHeight: '1.4' }}>
               {stageDetails}
@@ -273,7 +277,7 @@ function TrainingProgressPanel({ progress, jobStatus, errorLog, isCompact = fals
         </div>
 
         {/* Telemetry/Metrics Grid */}
-        {currentStage === 'training' && (
+        {['training', 'validating', 'checkpointing'].includes(currentStage) && (
           <div style={{ 
             display: 'grid', 
             gridTemplateColumns: isCompact ? '1fr 1fr' : '1fr 1fr 1fr', 

@@ -3,6 +3,7 @@ import sys
 import time
 import traceback
 import logging
+from collections import deque
 
 # Ensure parent directory is in python path (project root)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -155,6 +156,9 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
         
     # Transition to Running
     StateManager.transition_job(db, job_record, "Running", "Acquired GPU lock and started training loop")
+    if run_record:
+        run_record.status = "Running"
+        db.commit()
     
     # Resolve dataset storage path from DB before importing trainer (avoids CUDA/DB conflict)
     dataset_file_path = None
@@ -162,7 +166,31 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
     if dataset_version:
         dataset_file_path = dataset_version.storage_path
         logger.info(f"Resolved dataset storage path for task: {dataset_file_path}")
-        
+
+    last_progress_data = None
+    last_progress_at = None
+    recent_trainer_lines = deque(maxlen=25)
+    subprocess_traceback = None
+
+    def build_failure_report(error_message: str) -> str:
+        sections = [f"Training failed: {error_message}"]
+        if last_progress_data:
+            progress_bits = [
+                f"stage={last_progress_data.get('stage')}",
+                f"details={last_progress_data.get('stage_details')}",
+                f"epoch={last_progress_data.get('epoch')}/{last_progress_data.get('total_epochs')}",
+                f"step={last_progress_data.get('step')}/{last_progress_data.get('total_steps')}",
+            ]
+            if last_progress_at:
+                progress_bits.append(f"last_progress_age_seconds={round(time.time() - last_progress_at, 1)}")
+            sections.append("Last progress: " + ", ".join(str(bit) for bit in progress_bits if bit))
+        if subprocess_traceback:
+            sections.append("Trainer traceback:\n" + subprocess_traceback)
+        if recent_trainer_lines:
+            sections.append("Recent trainer output:\n" + "\n".join(recent_trainer_lines))
+        sections.append("Worker traceback:\n" + traceback.format_exc())
+        return "\n\n".join(sections)
+
     try:
         import subprocess
         import json
@@ -180,7 +208,7 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
             callback_db = SessionLocal()
             try:
                 # Renew lock
-                gpu_scheduler.renew_gpu_lock(job_id, lease_seconds=300)
+                gpu_scheduler.renew_gpu_lock(job_id, lease_seconds=1200)
                 
                 # Update run record if metrics/telemetry are provided
                 r = callback_db.query(ExperimentRun).filter(ExperimentRun.id == run_id).first()
@@ -335,9 +363,13 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
                 
             if line:
                 stripped = line.strip()
+                if stripped:
+                    recent_trainer_lines.append(stripped)
                 if stripped.startswith("PROGRESS:"):
                     try:
                         progress_data = json.loads(stripped[len("PROGRESS:"):])
+                        last_progress_data = progress_data
+                        last_progress_at = time.time()
                         training_callback(**progress_data)
                     except Exception as e:
                         logger.warning(f"Failed to parse progress telemetry line: {e}")
@@ -350,6 +382,7 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
                     try:
                         error_data = json.loads(stripped[len("ERROR:"):])
                         subprocess_error = error_data.get("error", "Unknown training error")
+                        subprocess_traceback = error_data.get("traceback")
                     except Exception as e:
                         subprocess_error = stripped
                 else:
@@ -372,6 +405,8 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
         if return_code != 0:
             err_msg = subprocess_error or f"Trainer subprocess exited with code {return_code}"
             raise RuntimeError(err_msg)
+        if results is None:
+            raise RuntimeError("Trainer subprocess exited successfully but did not emit a RESULT payload.")
         
         # Finalize Experiment Run
         if run_record:
@@ -398,10 +433,17 @@ def train_model_task(self, job_id: str, run_id: str, dataset_version_id: str, co
                 run_record.metrics = {**(run_record.metrics or {}), "error": "Job cancelled by user"}
                 db.commit()
         else:
+            failure_report = build_failure_report(str(e))
             if run_record:
                 run_record.status = "Failed"
-                run_record.metrics = {**(run_record.metrics or {}), "error": str(e)}
-            job_record.error_log = traceback.format_exc()
+                run_record.metrics = {**(run_record.metrics or {}), "error": failure_report}
+            failed_progress = {
+                **(last_progress_data or {}),
+                "stage": "failed",
+                "stage_details": str(e),
+            }
+            job_record.config = {**(job_record.config or {}), "progress": failed_progress}
+            job_record.error_log = failure_report
             try:
                 StateManager.transition_job(db, job_record, "Failed", f"Training crashed: {str(e)}")
             except Exception as transition_err:
@@ -619,4 +661,3 @@ def convert_to_ctranslate2_task(model_id: str):
         logger.error(f"CTranslate2 conversion failed for model {model_id}: {e}", exc_info=True)
     finally:
         db.close()
-

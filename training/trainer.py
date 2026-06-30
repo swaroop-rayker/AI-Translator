@@ -437,6 +437,18 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
         for epoch in range(resume_epoch, epochs + 1):
             model.train()
             total_loss = 0
+
+            if callback:
+                callback(
+                    stage="training",
+                    stage_progress=(global_step / num_training_steps) * 100,
+                    stage_details=f"Starting Epoch {epoch}/{epochs}...",
+                    epoch=epoch,
+                    step=global_step,
+                    total_steps=num_training_steps,
+                    steps_per_epoch=len(train_dataloader),
+                    total_epochs=epochs
+                )
             
             for step, batch in enumerate(train_dataloader):
                 # Skip already completed steps if resuming this epoch
@@ -518,16 +530,19 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
                     
                     val_loss = None
                     if step == len(train_dataloader) - 1:
+                        val_batch_count = len(val_dataloader)
                         if callback:
                             callback(
-                                stage="training",
+                                stage="validating",
                                 stage_progress=(global_step / num_training_steps) * 100,
-                                stage_details=f"Evaluating validation set for Epoch {epoch}...",
+                                stage_details=f"Starting validation after Epoch {epoch}/{epochs}...",
                                 epoch=epoch,
                                 step=global_step,
                                 loss=current_loss,
                                 val_loss=None,
                                 system_metrics=sys_metrics,
+                                current_value=0,
+                                total_value=val_batch_count,
                                 total_steps=num_training_steps,
                                 steps_per_epoch=len(train_dataloader),
                                 total_epochs=epochs
@@ -535,12 +550,43 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
                         model.eval()
                         val_losses = []
                         with torch.no_grad():
-                            for val_batch in val_dataloader:
+                            validation_report_interval = max(1, val_batch_count // 20) if val_batch_count else 1
+                            for val_idx, val_batch in enumerate(val_dataloader, start=1):
                                 val_outputs = model(**val_batch)
                                 val_losses.append(val_outputs.loss.item())
+                                if callback and (val_idx == 1 or val_idx == val_batch_count or val_idx % validation_report_interval == 0):
+                                    callback(
+                                        stage="validating",
+                                        stage_progress=(global_step / num_training_steps) * 100,
+                                        stage_details=f"Validating Epoch {epoch}/{epochs}: batch {val_idx}/{val_batch_count}",
+                                        epoch=epoch,
+                                        step=global_step,
+                                        loss=current_loss,
+                                        val_loss=None,
+                                        system_metrics=get_system_telemetry(),
+                                        current_value=val_idx,
+                                        total_value=val_batch_count,
+                                        total_steps=num_training_steps,
+                                        steps_per_epoch=len(train_dataloader),
+                                        total_epochs=epochs
+                                    )
                         val_loss = sum(val_losses) / len(val_losses) if val_losses else 0.0
                         model.train()
                         logger.info(f"Epoch {epoch} Eval | Validation Loss: {val_loss:.4f}")
+                        if callback:
+                            callback(
+                                stage="training",
+                                stage_progress=(global_step / num_training_steps) * 100,
+                                stage_details=f"Validation completed for Epoch {epoch}/{epochs}.",
+                                epoch=epoch,
+                                step=global_step,
+                                loss=current_loss,
+                                val_loss=val_loss,
+                                system_metrics=get_system_telemetry(),
+                                total_steps=num_training_steps,
+                                steps_per_epoch=len(train_dataloader),
+                                total_epochs=epochs
+                            )
                     
                     elapsed_loop = time.time() - training_loop_start
                     samples_per_sec = samples_processed / elapsed_loop if elapsed_loop > 0 else 0.0
@@ -568,15 +614,54 @@ def run_training(dataset_version_id: str, config: dict, callback=None, dataset_f
                 
                 if callback:
                     callback(
-                        stage="finalizing",
-                        stage_progress=95.0,
-                        stage_details=f"Saving checkpoint for epoch {epoch}..."
+                        stage="checkpointing",
+                        stage_progress=(global_step / num_training_steps) * 100,
+                        stage_details=f"Preparing checkpoint directory after Epoch {epoch}/{epochs}...",
+                        epoch=epoch,
+                        step=global_step,
+                        total_steps=num_training_steps,
+                        steps_per_epoch=len(train_dataloader),
+                        total_epochs=epochs
                     )
                     
                 unwrapped_model = accelerator.unwrap_model(model)
+                if callback:
+                    callback(
+                        stage="checkpointing",
+                        stage_progress=(global_step / num_training_steps) * 100,
+                        stage_details=f"Writing model weights for Epoch {epoch}/{epochs} checkpoint...",
+                        epoch=epoch,
+                        step=global_step,
+                        total_steps=num_training_steps,
+                        steps_per_epoch=len(train_dataloader),
+                        total_epochs=epochs
+                    )
                 unwrapped_model.save_pretrained(epoch_ckpt_dir)
+                if callback:
+                    callback(
+                        stage="checkpointing",
+                        stage_progress=(global_step / num_training_steps) * 100,
+                        stage_details=f"Writing tokenizer files for Epoch {epoch}/{epochs} checkpoint...",
+                        epoch=epoch,
+                        step=global_step,
+                        total_steps=num_training_steps,
+                        steps_per_epoch=len(train_dataloader),
+                        total_epochs=epochs
+                    )
                 tokenizer.save_pretrained(epoch_ckpt_dir)
                 checkpoint_paths.append(epoch_ckpt_dir)
+
+                if callback:
+                    callback(
+                        stage="checkpointing",
+                        stage_progress=(global_step / num_training_steps) * 100,
+                        stage_details=f"Checkpoint saved for Epoch {epoch}/{epochs}.",
+                        epoch=epoch,
+                        step=global_step,
+                        total_steps=num_training_steps,
+                        steps_per_epoch=len(train_dataloader),
+                        total_epochs=epochs
+                    )
             
     except RuntimeError as e:
         torch.cuda.empty_cache()

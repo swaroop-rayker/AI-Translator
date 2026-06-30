@@ -9,10 +9,85 @@ import os
 import uuid
 import logging
 import shutil
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/jobs", tags=["orchestration"])
+
+TRAINING_STALE_SECONDS = int(os.getenv("TRAINING_STALE_SECONDS", "1800"))
+
+def _reconcile_stale_training_jobs(db: Session):
+    """
+    Mark orphaned training jobs as failed when the GPU lock is gone and no
+    progress heartbeat has updated the job for a while. This prevents the UI
+    from staying in Running forever if the local worker process dies.
+    """
+    try:
+        gpu_status = gpu_scheduler.get_gpu_status()
+        active_job_id = gpu_status.get("active_job_id") if gpu_status.get("is_locked") else None
+        now = datetime.utcnow()
+
+        running_jobs = (
+            db.query(Job)
+            .filter(Job.job_type == "training", Job.status.in_(["Starting", "Running"]))
+            .all()
+        )
+
+        for job in running_jobs:
+            if active_job_id == job.id:
+                continue
+
+            last_update = job.updated_at or job.created_at
+            if not last_update or (now - last_update).total_seconds() < TRAINING_STALE_SECONDS:
+                continue
+
+            progress = job.config.get("progress") if job.config else None
+            progress_context = ""
+            if progress:
+                progress_context = (
+                    f" Last known stage: {progress.get('stage')}."
+                    f" Details: {progress.get('stage_details')}."
+                    f" Epoch: {progress.get('epoch')}/{progress.get('total_epochs')}."
+                    f" Step: {progress.get('step')}/{progress.get('total_steps')}."
+                )
+            error = (
+                "Training worker stopped reporting progress and no GPU lock is active "
+                f"for this job for more than {TRAINING_STALE_SECONDS} seconds."
+                f"{progress_context} The most likely causes are a killed trainer process, "
+                "a crashed Celery worker, host restart, or an unhandled native CUDA/PyTorch failure."
+            )
+            logger.warning(f"Marking stale training job {job.id} as Failed: {error}")
+            job.error_log = error
+            job.config = {
+                **(job.config or {}),
+                "progress": {
+                    **(progress or {}),
+                    "stage": "failed",
+                    "stage_details": error,
+                }
+            }
+            StateManager.transition_job(db, job, "Failed", error)
+
+            run = (
+                db.query(ExperimentRun)
+                .filter(ExperimentRun.run_name.like(f"run-{job.id[:8]}%"))
+                .order_by(ExperimentRun.created_at.desc())
+                .first()
+            )
+            if run and run.status not in ["Completed", "Failed", "Cancelled"]:
+                run.status = "Failed"
+                run.metrics = {**(run.metrics or {}), "error": error}
+
+            dataset_version_id = job.config.get("dataset_version_id") if job.config else None
+            if dataset_version_id:
+                dataset_version = db.query(DatasetVersion).filter(DatasetVersion.id == dataset_version_id).first()
+                if dataset_version and dataset_version.status == "TrainingUsed":
+                    StateManager.transition_dataset(db, dataset_version, "TrainReady", "Stale training job failed. Rolled back state.")
+
+            db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to reconcile stale training jobs: {e}")
 
 @router.get("/status")
 def get_system_status(db: Session = Depends(get_db)):
@@ -197,6 +272,7 @@ def list_jobs(db: Session = Depends(get_db)):
     """
     List all platform jobs and tasks.
     """
+    _reconcile_stale_training_jobs(db)
     return db.query(Job).order_by(Job.created_at.desc()).all()
 
 @router.get("/{job_id}")
@@ -204,6 +280,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     """
     Fetches status and progress details of a single job.
     """
+    _reconcile_stale_training_jobs(db)
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -677,4 +754,3 @@ def resume_training_run(job_id: str, db: Session = Depends(get_db)):
     db.commit()
     
     return {"status": "Queued", "job_id": job_id, "celery_task_id": task.id}
-
